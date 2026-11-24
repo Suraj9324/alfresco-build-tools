@@ -1,0 +1,101 @@
+---
+title: Skills
+---
+
+This repository ships [Agent Skills](https://docs.claude.com/en/docs/claude-code/skills):
+reusable instructions that AI coding agents (such as Claude Code) load on demand to
+perform repository-specific tasks. Each skill lives in its own directory under
+[`.github/skills/`](https://github.com/Alfresco/alfresco-build-tools/tree/master/.github/skills)
+as a `SKILL.md` file with YAML front-matter (`name`, `description`) followed by the
+instructions.
+
+Agents discover skills automatically from the `description` field, so keep it specific
+about **what the skill does** and **when to use it**.
+
+## Installing a skill
+
+From a checkout of this repo, the simplest way to make a skill available to your agent
+is to paste this into it:
+
+```text
+Symlink .github/skills/<skill-name> from this checkout into your personal skills
+directory, so it stays in sync with the repo.
+```
+
+For Claude Code, that means:
+
+```bash
+mkdir -p ~/.claude/skills
+ln -s "$(pwd)/.github/skills/<skill-name>" ~/.claude/skills/<skill-name>
+```
+
+Without a checkout, copy the "Copy-paste this into your agent" snippet from the
+skill's entry below instead.
+
+## Available skills
+
+### migrate-action-to-uv
+
+Migrate a composite GitHub Action from `requirements.txt` + `pip` to
+[`uv`](https://github.com/astral-sh/uv) with `pyproject.toml` and a lockfile. Use it
+when modernizing Python dependency management in an action: it replaces the
+`setup-python` + pip-cache + `pip install` steps with `setup-uv`, converts scripts to
+run via `uv run --frozen --project`, and updates `dependabot.yml` accordingly.
+
+Copy-paste this into your agent:
+
+```text
+Fetch https://raw.githubusercontent.com/Alfresco/alfresco-build-tools/master/.github/skills/migrate-action-to-uv/SKILL.md
+and follow it to migrate this composite action from requirements.txt/pip to uv.
+```
+
+### nexus2cloudsmith
+
+Migrate a Maven repository's CI from the Alfresco Nexus (`artifacts.alfresco.com`)
+to Cloudsmith (`artifacts.hyland.dev`). It covers both phases: pulling dependencies
+from Cloudsmith, and deploying releases there through the
+[cloudsmith-auth](README.md#cloudsmith-auth) OIDC action instead of the Nexus
+secrets.
+
+Copy-paste this into your agent:
+
+```text
+Fetch https://raw.githubusercontent.com/Alfresco/alfresco-build-tools/master/.github/skills/nexus2cloudsmith/SKILL.md
+and follow it to migrate this repo from Nexus to Cloudsmith.
+```
+
+### pimp-my-readme
+
+Create or upgrade a repository's `README.md` to a standard layout: title, CI/release/license
+badges, a short purpose statement, related repositories, a table of contents, a copy-paste
+quickstart, a testing section, and a configuration table when the project has parameters to
+document. Works on a repo with no README as well as one that already has content, keeping
+any section outside the template where it is.
+
+Copy-paste this into your agent:
+
+```text
+Fetch https://raw.githubusercontent.com/Alfresco/alfresco-build-tools/master/.github/skills/pimp-my-readme/SKILL.md
+and follow it to create or upgrade this repo's README.md.
+```
+
+### pimp-my-repo
+
+Bootstrap or standardize a repository's baseline configuration: Dependabot,
+pre-commit, SHA-pinned actions, `.gitignore`, `AGENTS.md`, and workflow hardening.
+
+Copy-paste this into your agent:
+
+```text
+Fetch https://raw.githubusercontent.com/Alfresco/alfresco-build-tools/master/.github/skills/pimp-my-repo/SKILL.md
+and follow it to set up baseline DevOps hygiene in this repo.
+```
+
+## Adding a new skill
+
+1. Create `.github/skills/<skill-name>/SKILL.md` with `name` and `description`
+   front-matter, then the instructions in Markdown.
+2. Keep the `description` action-oriented and list the triggering situations, so agents
+   know when to load it.
+3. Add supporting files (scripts, templates) alongside `SKILL.md` when needed.
+4. Document the new skill in this file.

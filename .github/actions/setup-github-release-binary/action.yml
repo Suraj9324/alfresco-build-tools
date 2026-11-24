@@ -1,0 +1,130 @@
+name: Setup GitHub Release Binary
+description: 'Set up a specific version of a binary from GitHub Releases and add it to the PATH.'
+inputs:
+  repo:
+    description: 'Repository of binary in the form owner/repo'
+    required: true
+  version:
+    description: 'Version of binary'
+    required: true
+  url_template:
+    description: 'Template for download url, can use VERSION/NAME/OS/ARCH env vars'
+    required: false
+    default: 'v${VERSION}/${NAME}_${VERSION}_${OS}_${ARCH}.tar.gz'
+  test_args:
+    description: 'Arguments to test the binary'
+    required: false
+    default: '--version'
+  x86_64_arch:
+    description: 'Override the package architecture when x86_64'
+    required: false
+    default: 'amd64'
+  aarch64_arch:
+    description: 'Override the package architecture when aarch64'
+    required: false
+    default: 'arm64'
+  binary_name:
+    description: 'Override the binary name, defaults to repo name'
+    required: false
+    default: ''
+  checksums:
+    description: 'SHA256 checksums for verification. Can be a single checksum string or a JSON object mapping OS_ARCH to checksums (e.g., {"linux_amd64": "abc...", "darwin_arm64": "def..."})'
+    required: false
+    default: ''
+runs:
+  using: "composite"
+  steps:
+    - name: Download binary
+      id: download
+      shell: bash
+      env:
+        REPO: ${{ inputs.repo }}
+        VERSION: ${{ inputs.version }}
+        URL_TEMPLATE: ${{ inputs.url_template }}
+        BINARY_NAME: ${{ inputs.binary_name }}
+      working-directory: ${{ runner.temp }}
+      run: |
+        NAME=${BINARY_NAME:-${REPO##*\/}}
+        OS=$(uname | tr '[:upper:]' '[:lower:]')
+        ARCH_RAW=$(uname -m)
+        case $ARCH_RAW in
+          x86_64) ARCH=${ARCH:-${{ inputs.x86_64_arch }}} ;;
+          aarch64) ARCH=${ARCH:-${{ inputs.aarch64_arch }}} ;;
+          *) ARCH=${ARCH:-$ARCH_RAW} ;;
+        esac
+
+        URL=https://github.com/$REPO/releases/download/$(eval echo $URL_TEMPLATE)
+        ARCHIVE=$(basename "$URL")
+
+        echo "Downloading $URL ..."
+        curl -fsSL -o "$ARCHIVE" "$URL"
+
+        # Store values for next steps
+        echo "binary_name=$NAME" >> $GITHUB_OUTPUT
+        echo "binary_os=$OS" >> $GITHUB_OUTPUT
+        echo "binary_arch=$ARCH" >> $GITHUB_OUTPUT
+        echo "binary_archive=$ARCHIVE" >> $GITHUB_OUTPUT
+
+    - name: Validate checksum
+      shell: bash
+      env:
+        CHECKSUMS: ${{ inputs.checksums }}
+        BINARY_NAME: ${{ steps.download.outputs.binary_name }}
+        BINARY_ARCHIVE: ${{ steps.download.outputs.binary_archive }}
+        BINARY_OS: ${{ steps.download.outputs.binary_os }}
+        BINARY_ARCH: ${{ steps.download.outputs.binary_arch }}
+      working-directory: ${{ runner.temp }}
+      run: |
+        # Calculate checksum
+        ACTUAL_CHECKSUM=$(shasum -a 256 "$BINARY_ARCHIVE" | awk '{print $1}')
+
+        # Determine expected checksum
+        EXPECTED_CHECKSUM=""
+        if [[ -n "$CHECKSUMS" ]]; then
+          if [[ "$CHECKSUMS" =~ ^[a-fA-F0-9]{64}$ ]]; then
+            EXPECTED_CHECKSUM="$CHECKSUMS"
+          else
+            if ! command -v jq &> /dev/null; then
+              echo "::error::jq is required to parse checksums JSON but it's not installed. Please install jq or provide a single checksum string."
+              exit 1
+            fi
+
+            PLATFORM_KEY="${BINARY_OS}_${BINARY_ARCH}"
+            EXPECTED_CHECKSUM=$(echo "$CHECKSUMS" | jq -r --arg key "$PLATFORM_KEY" '.[$key] // ""' 2>/dev/null || echo "")
+
+            if [[ -z "$EXPECTED_CHECKSUM" ]]; then
+              echo "::warning::No checksum found for $BINARY_NAME on platform '$PLATFORM_KEY' in checksums JSON, or invalid JSON format provided"
+            fi
+          fi
+        fi
+
+        # Validate checksum if we have one
+        if [[ -n "$EXPECTED_CHECKSUM" ]]; then
+          echo "Validating checksum for platform ${BINARY_OS}_${BINARY_ARCH}..."
+          if [[ "$ACTUAL_CHECKSUM" != "$EXPECTED_CHECKSUM" ]]; then
+            echo "::error::Checksum validation failed for $BINARY_NAME! Expected: $EXPECTED_CHECKSUM, Actual: $ACTUAL_CHECKSUM"
+            exit 1
+          fi
+          echo "Checksum validation passed ✓"
+        else
+          echo "::warning::No checksum provided for verification of $BINARY_NAME. Add this to your action inputs for improved security: checksums: '{\"${BINARY_OS}_${BINARY_ARCH}\": \"${ACTUAL_CHECKSUM}\"}'"
+        fi
+
+    - name: Install binary
+      shell: bash
+      env:
+        BINARY_ARCHIVE: ${{ steps.download.outputs.binary_archive }}
+        BINARY_NAME: ${{ steps.download.outputs.binary_name }}
+      working-directory: ${{ runner.temp }}
+      run: |
+        if [[ "$BINARY_ARCHIVE" == *.zip ]]; then
+          unzip -j -qq "$BINARY_ARCHIVE" "*$BINARY_NAME" -d .
+        elif [[ "$BINARY_ARCHIVE" == *.tar.gz ]] || [[ "$BINARY_ARCHIVE" == *.tgz ]]; then
+          tar -xzf "$BINARY_ARCHIVE" "$BINARY_NAME"
+        else
+          mv "$BINARY_ARCHIVE" "$BINARY_NAME"
+          chmod +x "$BINARY_NAME"
+        fi
+
+        sudo mv "$BINARY_NAME" /usr/local/bin/"$BINARY_NAME"
+        "$BINARY_NAME" ${{ inputs.test_args }}

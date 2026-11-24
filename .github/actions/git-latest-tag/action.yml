@@ -1,0 +1,28 @@
+name: Get latest tag for pattern
+description: Get the latest tag for the given pattern
+inputs:
+  pattern:
+    description: >
+      The pattern used to filter the tags: any expression supported by `git tag --list "expression"`
+    required: false
+    default: '*'
+  repository-directory:
+    description: Optional path to the the directory holding the git repository (defaults to current directory)
+    required: false
+outputs:
+  tag:
+    description: the latest tag found for the pattern provided as input
+    value: ${{steps.latest-tag.outputs.tag}}
+  tag_long_sha:
+    description: the latest tag long sha found for the pattern provided as input
+    value: ${{steps.latest-tag.outputs.tag_long_sha}}
+runs:
+  using: composite
+  steps:
+    - name: get latest tag
+      id: latest-tag
+      shell: bash
+      env:
+        PATTERN: ${{ inputs.pattern }}
+        REPO_DIR: ${{ inputs.repository-directory }}
+      run: ${{ github.action_path }}/git-latest-tag.sh

@@ -1,0 +1,49 @@
+name: "Package helm chart"
+description: "Package helm chart by running `helm dep up` and ` helm package`"
+inputs:
+  chart-dir:
+    description: Relative path to the folder holding Chart.yaml
+    required: true
+  chart-repository-dir:
+    description: Optional path to the git repository holding the chart project (defaults to current directory)
+    required: false
+outputs:
+  package-file:
+    description: The name of the generated package file. It's uploaded as an artifact and can be downloaded using actions/download-artifact
+    value: ${{ steps.package.outputs.package-file }}
+  package-file-path:
+    description: The path of the generated package file.
+    value: ${{ steps.package.outputs.package-file-path }}
+
+runs:
+  using: composite
+  steps:
+
+    - name: Generate random path for helm package
+      shell: bash
+      run: echo "RANDOM_PATH=$(uuidgen)" >> $GITHUB_ENV
+
+    - name: Package chart
+      id: package
+      shell: bash
+      env:
+        CHART_REPO_DIR: ${{inputs.chart-repository-dir }}
+      run: |
+        if [ -n "$CHART_REPO_DIR" ]
+        then
+          cd $CHART_REPO_DIR
+        fi
+
+        helm package --dependency-update --destination $RANDOM_PATH ${{ inputs.chart-dir }}
+
+        PACKAGE_FILE=$(ls $RANDOM_PATH | grep "**/*\.tgz")
+        PACKAGE_FILE_PATH="$(pwd)/$RANDOM_PATH/$PACKAGE_FILE"
+        echo "package-file=$PACKAGE_FILE" >> $GITHUB_OUTPUT
+        echo "package-file-path=$PACKAGE_FILE_PATH" >> $GITHUB_OUTPUT
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{steps.package.outputs.package-file}}
+        path: ${{steps.package.outputs.package-file-path}}
+        if-no-files-found: error

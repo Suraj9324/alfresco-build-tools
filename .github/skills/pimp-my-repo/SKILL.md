@@ -1,0 +1,403 @@
+---
+name: pimp-my-repo
+description: "Bootstrap or standardize a GitHub repository's baseline configuration: Dependabot, pre-commit, SHA-pinned actions, .gitignore, AGENTS.md, and workflow hardening. Use when setting up a new repo, adding a missing Dependabot or pre-commit config, or bringing an existing repo up to standard."
+---
+
+# Pimp My Repo
+
+Bootstrap the standard configuration a full-featured GitHub repository should have. Work
+through the steps below, tailoring each to what the repo actually contains. Skip anything
+already configured correctly; merge rather than overwrite.
+
+1. **Dependabot** — `.github/dependabot.yml` derived from the ecosystems in use.
+2. **Pre-commit** — a baseline `.pre-commit-config.yaml` with the standard hooks, wired
+   into CI via this repo's reusable `pre-commit` action, placed wherever best fits the
+   repo's existing workflows.
+3. **SHA-pinning** — every workflow references third-party actions by commit SHA; any
+   Dockerfile pins its base images by digest.
+4. **Gitignore** — common ignores for the repo's stack, plus Claude Code artifacts.
+5. **AI assistant instructions** — `AGENTS.md` with a thin `CLAUDE.md`.
+6. **Secrets & permissions** — least-privilege secret scoping and workflow permissions.
+7. **Step names** — every workflow step has a short `name:`.
+8. **`if:` conditions** — no redundant `${{ }}` wrapper around `if:` expressions.
+
+## 1. Dependabot config
+
+Generate (or extend) `.github/dependabot.yml` based on what the repo actually
+contains. Detect the ecosystems in use from their marker files (`package.json`,
+`pom.xml`, `pyproject.toml`/`uv.lock`, `go.mod`, `Dockerfile`, `*.tf`, etc.) and emit
+one `updates` block per ecosystem found — never for tooling the repo doesn't use.
+
+Rules for every block:
+
+- **`github-actions` is always included**, even when no other ecosystem is detected.
+- **Grouping is always enabled** — at least one catch-all group so Dependabot opens one
+  grouped PR per ecosystem instead of many.
+- Weekly `schedule`, 7-day `cooldown`, and `directories:` (plural) pointing at the
+  parent dirs of the marker files (collapse siblings with a glob).
+- Label with `dependencies` plus an ecosystem-specific label.
+
+**Every label referenced must exist in the repo**, or Dependabot silently skips
+labeling the PR and leaves a comment like: *"The following labels could not be found:
+`docker`. Please create it before Dependabot can add it to a pull request."* Check with
+`gh label list`, then create any missing ones before finishing:
+
+```bash
+gh label create docker --description "Docker/Dockerfile dependencies" --color 0db7ed
+```
+
+Pick a description and color that fit the ecosystem; reuse an existing label's color
+scheme if the repo already has similar ones (e.g. other ecosystem labels).
+
+```yaml
+# Documentation for all configuration options:
+# https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directories:
+      - "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github_actions"
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+```
+
+Add further blocks in the same shape for each detected ecosystem. Only split into extra
+named groups when a family of dependencies must always move together. When the file
+already exists, preserve existing `ignore`, `groups`, and custom `directories`.
+
+## 2. Pre-commit config
+
+Add a baseline `.pre-commit-config.yaml` with the standard hooks, with every `rev`
+frozen to the commit SHA of the latest release of each repo (`rev: <sha>  # frozen: vX.Y.Z`),
+never a bare tag. Include language-specific hooks (black/isort/flake8, shellcheck, …) only
+for languages the repo actually uses.
+
+```yaml
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
+    hooks:
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-json
+      - id: check-xml
+      - id: check-merge-conflict
+      - id: fix-byte-order-marker
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/sirosen/check-jsonschema
+    rev: 39478bf2c099a58683d3f1aedf675105318b078d  # frozen: 0.39.0
+    hooks:
+      - id: check-dependabot
+      - id: check-github-actions
+      - id: check-github-workflows
+
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: cbcdc463be5464e25e3e955a511599a67b9b987f  # frozen: v0.50.0
+    hooks:
+      - id: markdownlint
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # frozen: v1.7.12
+    hooks:
+      - id: actionlint
+
+  - repo: https://github.com/hyland/github-actions-ensure-sha-pinned-actions
+    rev: 9f71a10c9852b115cfcb146ec2d8d09e2b89593f  # frozen: v2.1.1
+    hooks:
+      - id: gha-sha-convert
+        args: [--allowlist, 'Alfresco/alfresco-build-tools/*']
+```
+
+### Python
+
+If the repo contains non-trivial Python scripts — i.e. more than just CI glue under
+100 lines of code — suggest `ruff` for linting and formatting. Check the
+[releases page](https://github.com/astral-sh/ruff-pre-commit/releases) for the latest
+`rev` (frozen to its commit SHA) before adding it:
+
+```yaml
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: ef6cf06c079dd6b299dfc720b0f14400c9d168e1  # frozen: v0.17.5
+    hooks:
+      - id: ruff-check
+        args: [ --fix ]
+      - id: ruff-format
+```
+
+If the repo already lints/formats Python with `black`, `isort`, and/or `flake8`,
+suggest migrating to `ruff` rather than adding it alongside — ruff supersedes all
+three with a single, much faster tool. Only propose this as a separate suggestion
+to the user, since dropping existing hooks is a bigger change than adding a new
+one; don't fold it silently into an unrelated pre-commit change.
+
+### Wire into CI
+
+Wire the config into CI by calling this repo's reusable `pre-commit` action
+([documented here](https://github.com/Alfresco/alfresco-build-tools/blob/master/docs/README.md#pre-commit))
+instead of hand-rolling the pre-commit invocation. Use the latest released tag
+(check `git tag` in this repo, or the [releases page](https://github.com/Alfresco/alfresco-build-tools/releases)
+for the current version). Unlike other third-party actions (see
+[SHA-pinning](#3-sha-pin-third-party-actions) below), a version tag is fine here:
+`alfresco-build-tools` release tags are immutable, so pinning further has no security
+benefit (though it's harmless if you prefer it).
+
+Where the job goes depends on the shape of the target repo's existing workflows — check
+in this order and stop at the first match:
+
+1. **A single main workflow drives most CI activity** (build, test, publish, …). Add
+   `pre-commit` as that workflow's first job, and make every other job depend on it via
+   `needs: pre-commit` so a hook failure blocks the rest of the run.
+2. **No single main workflow, but one is clearly dedicated to linting/static checks**
+   (e.g. named `lint.yml`, or a job doing `actionlint`/`yamllint`/similar). Add
+   `pre-commit` as a job there instead of creating a new file.
+3. **Neither applies** (no workflows yet, or several unrelated ones with none a natural
+   home). Create a new workflow, named by the repo's age (`git rev-list --count HEAD`):
+
+   - **10 commits or fewer** (new repo): `ci.yml`, so it becomes the main workflow that
+     later build/test jobs join.
+   - **More than 10 commits** (established repo): `pre-commit.yml`, dedicated to this job
+     and leaving the existing workflows alone.
+
+   Match the extension the existing workflows use (`.yml` or `.yaml`), defaulting to
+   `.yml`. Replace `<default-branch>` with the repo's actual default branch (e.g.
+   `git remote show origin | sed -n 's/HEAD branch: //p'`).
+
+   ```yaml
+   # .github/workflows/ci.yml (or pre-commit.yml)
+   name: ci # or pre-commit
+
+   on:
+     pull_request:
+       branches: [<default-branch>]
+     push:
+       branches: [<default-branch>]
+
+   jobs:
+     pre-commit:
+       runs-on: ubuntu-latest
+       permissions:
+         contents: read # bump to write only if you enable auto-commit below
+       steps:
+         - uses: Alfresco/alfresco-build-tools/.github/actions/pre-commit@v19.17.0
+           with:
+             auto-commit: "false" # set to "true" (and permissions.contents above to write) to auto-commit fixups
+   ```
+
+In cases 1 and 2, add the same `steps:` shown above as a job named `pre-commit` in the
+existing workflow, keeping its own `on:` triggers untouched.
+
+### Validate locally
+
+Besides wiring pre-commit into CI, check whether `pre-commit` is available locally and
+use it to validate the new hooks before they ever hit CI:
+
+```bash
+command -v pre-commit
+```
+
+- **If it's available**, install the hooks, bump the baseline `rev`s to each hook's
+  actual latest release frozen to commit SHAs, and run them across the whole repo, then fix
+  anything that fails before moving on:
+
+  ```bash
+  pre-commit install
+  pre-commit autoupdate --freeze
+  pre-commit run --all-files
+  ```
+
+  The `rev`s in the baseline config above are a snapshot from when this skill was
+  written — `autoupdate` keeps them current instead of drifting stale from day one, and
+  `--freeze` pins each one to a commit SHA so a moved or re-pushed tag can't change the code
+  that runs.
+
+- **If it's missing**, tell the user explicitly: running pre-commit locally means you
+  catch (and fix) issues before pushing, instead of waiting on CI to fail. Ask them to
+  install it with one of:
+
+  ```bash
+  pip install pre-commit
+  # or
+  brew install pre-commit
+  ```
+
+  Then re-run the check above and proceed with `pre-commit install`, `pre-commit
+  autoupdate --freeze`, and `pre-commit run --all-files` once it's installed. If they decline,
+  continue with the rest of the setup and note that the config is untested locally and
+  the pinned `rev`s may be stale compared to upstream releases; enabling `auto-commit`
+  on the CI job above still catches and fixes issues without a local install, though the
+  bot's auto-commit push usually does **not** retrigger CI on its own — the user will
+  need to push an empty commit to kick off another run once the auto-fix commit is in:
+
+  ```bash
+  git commit --allow-empty -m "Trigger CI" && git push
+  ```
+
+## 3. SHA-pin third-party actions
+
+Every workflow and composite action must reference third-party actions by full 40-char
+commit SHA, with the version as a trailing comment — mutable tags (`@v4`, `@main`) are
+forbidden for security.
+
+```yaml
+- uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+```
+
+The `gha-sha-convert` hook above converts existing tag refs to SHA pins automatically.
+After wiring up pre-commit, run it across the repo and commit the result:
+
+```bash
+pre-commit run gha-sha-convert --all-files
+```
+
+Keep your first-party action refs (e.g. `<OWNER>/<REPO>/*`) on the allowlist only if you intentionally permit version tags for them; otherwise let `gha-sha-convert` pin them too.
+
+### Docker base images
+
+If the repo contains a `Dockerfile`, the same immutability argument applies to its
+`FROM` instructions: a tag like `node:20-bookworm` can move to a different image
+underneath it at any time, so pin the digest alongside the tag.
+
+```dockerfile
+FROM node:20.11.1-bookworm@sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b
+```
+
+Resolve the digest for the tag currently in use rather than guessing it:
+
+```bash
+docker pull node:20.11.1-bookworm
+docker inspect --format '{{index .RepoDigests 0}}' node:20.11.1-bookworm | cut -d@ -f2
+```
+
+(`RepoDigests` includes the repo name, e.g. `node@sha256:...`, so `cut` strips it down to
+the bare `sha256:...` that gets pasted after `image:tag@`.)
+
+Keep the tag in front of the digest (`image:tag@sha256:...`) so the version stays
+human-readable, the same way SHA-pinned actions keep their version as a comment. Apply
+this to every `FROM` line, including multi-stage build stages.
+
+## 4. Gitignore
+
+Ensure `.gitignore` covers the common entries for what the repo actually contains —
+build outputs, dependency directories, caches, editor/OS cruft, and local tooling
+artifacts for the languages and tools detected in step 1. Derive the set from the repo
+structure rather than dropping in a fixed list, and always include Claude Code's local
+artifacts:
+
+```gitignore
+# Claude Code local artifacts
+.claude
+```
+
+Add missing entries and keep the existing ordering and comment style consistent; don't
+duplicate or reorder what's already there.
+
+## 5. AI assistant instructions
+
+Keep repo guidance in a **single shared source of truth**. The actual instructions live
+in `AGENTS.md` at the repo root, which GitHub Copilot code review, Codex and other agents
+read directly. `CLAUDE.md` only imports it via Claude's native `@` syntax.
+
+If `AGENTS.md` is missing, generate it with the agent's `/init` operation, which
+documents the codebase (purpose, layout, build/test commands, conventions). Then arrange
+the result into the single-source layout:
+
+- Put the generated instructions in `AGENTS.md`.
+- Make `CLAUDE.md` at the repo root contain only the import line, with no title or
+  other content:
+
+  ```markdown
+  @AGENTS.md
+  ```
+
+If the repo uses the older layout (real content in `.github/copilot-instructions.md`
+and/or `CLAUDE.md`), migrate it: merge that content into `AGENTS.md`, reduce `CLAUDE.md`
+to the import line, and delete `.github/copilot-instructions.md`. Update any links to the
+old file, for example in `README.md`.
+
+## 6. Secrets and permissions in workflows
+
+Harden how workflows handle secrets and permissions.
+
+**Never put secrets in a top-level (workflow) `env` block.** A workflow-level `env`
+exposes secrets to every job and every step, including any third-party action that runs.
+
+Scope secrets as tightly as possible:
+
+- **Prefer step-level `env`** — declare the secret on the specific step that needs it.
+  Duplicating the same `env` block across several steps is fine and preferred; the
+  narrower exposure is worth the repetition.
+- **Job-level `env` is acceptable only** when the job runs no third-party actions —
+  GitHub-maintained actions such as `actions/checkout` don't count against this. As soon
+  as a job uses a third-party action, move secrets back down to the steps that need them.
+
+**Prefer a GitHub App over a personal access token (PAT)** for authenticated
+operations: App tokens are short-lived, scoped to the installation, and not tied to an
+individual. Mint a token at runtime (e.g. `actions/create-github-app-token`) instead of
+storing a long-lived PAT.
+
+**Always declare a workflow-level `permissions` block** with the minimum needed to check
+out the repo, then widen per-job only where required:
+
+```yaml
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@<sha> # vX.Y.Z
+
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # widened only for the job that needs it
+    steps:
+      - uses: actions/checkout@<sha> # vX.Y.Z
+      - name: Publish
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}   # step-level: scoped to where it's used
+        run: npm publish
+```
+
+## 7. Step names in workflows
+
+Give every workflow step a `name:`, including one-line `uses:` and `run:` steps.
+
+- Keep names short: `Checkout`, `Setup Java`, `Setup Go`, `Pre-commit`, `Compose up`, `Upload jar`.
+- A step that checks something starts with `Verify` (e.g. `Verify login`).
+- Name the step for what it does, not for the command or action behind it.
+
+## 8. `if:` conditions in workflows
+
+GitHub evaluates `if:` as an expression already, so a `${{ }}` wrapper around the whole
+condition is noise. Strip it from job- and step-level `if:` in every workflow and
+composite action:
+
+```yaml
+# before
+if: ${{ github.event_name == 'push' && inputs.publish }}
+# after
+if: github.event_name == 'push' && inputs.publish
+```
+
+- **Keep the wrapper when the condition starts with `!`**: YAML reads a bare leading
+  `!` as a tag, so `if: !cancelled()` doesn't parse. Wrap any existing bare one as
+  `if: ${{ !cancelled() }}`.
+- **Fix conditions that mix `${{ }}` with text outside it**, such as
+  `if: ${{ a }} && ${{ b }}`. GitHub treats the result as a non-empty string, so it is
+  always true. Rewrite it as one expression: `if: a && b`.
+- Leave `${{ }}` alone everywhere else (`with:`, `env:`, `run:`, …), where it is required.

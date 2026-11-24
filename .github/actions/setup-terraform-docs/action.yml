@@ -1,0 +1,15 @@
+name: 'Setup terraform-docs'
+description: 'Setup terraform-docs and add it to the PATH.'
+inputs:
+  version:
+    description: 'Version of terraform-docs'
+    required: false
+    default: 0.25.1
+runs:
+  using: "composite"
+  steps:
+    - uses: $/.github/actions/setup-github-release-binary
+      with:
+        repo: terraform-docs/terraform-docs
+        version: ${{ inputs.version }}
+        url_template: 'v${VERSION}/${NAME}-v${VERSION}-${OS}-${ARCH}.tar.gz'

@@ -1,0 +1,94 @@
+name: 'Setup Rancher CLI'
+description: 'Set up a specific version of Rancher CLI and add it to the PATH.'
+inputs:
+  version:
+    description: 'Version of Rancher CLI'
+    required: false
+  access-key:
+    description: 'Rancher API access key'
+    required: false
+  secret-key:
+    description: 'Rancher API secret key'
+    required: false
+  url:
+    description: 'Rancher URL'
+    required: false
+  context:
+    description: 'Rancher context for kubectl configuration'
+    required: false
+    default: local
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      run: |
+        TOOL_VERSION=${{ inputs.version != '' && inputs.version || env.DEFAULT_RANCHER_CLI_VERSION }}
+        TOOL_NAME=rancher
+        TOOL_REPO=rancher/cli
+        TOOL_OS=$(uname | tr '[:upper:]' '[:lower:]')
+        TOOL_ARCH=amd64
+        curl -fsSL https://github.com/$TOOL_REPO/releases/download/v$TOOL_VERSION/$TOOL_NAME-$TOOL_OS-$TOOL_ARCH-v$TOOL_VERSION.tar.gz \
+          | tar xz --strip=2 ./$TOOL_NAME-v$TOOL_VERSION/$TOOL_NAME
+        sudo mv $TOOL_NAME /usr/local/bin/
+        echo $($TOOL_NAME --version)
+      env:
+        DEFAULT_RANCHER_CLI_VERSION: 2.15.3
+    - shell: bash
+      run: |
+        set -o pipefail
+
+        # Capture login output (suppress automatic exit on failure to inspect status)
+        set +e
+        LOGIN_OUTPUT=$(echo 1 | rancher login "$RANCHER2_URL" -t "$RANCHER2_BEARER_TOKEN" 2>&1)
+        LOGIN_RC=$?
+        set -e
+        if [[ $LOGIN_RC -ne 0 ]]; then
+          echo "Error: rancher login failed (exit $LOGIN_RC). Output:"
+          echo "$LOGIN_OUTPUT"
+          exit 1
+        fi
+
+        # Find lines containing both the desired context and 'System'
+        # Set search pattern based on context format
+        if [[ $KUBECONTEXT =~ ^c-[a-z0-9]+$ ]]; then
+          # Context ID format - match exact ID followed by colon
+          SEARCH_PATTERN="$KUBECONTEXT:"
+        else
+          # Cluster name format - match with surrounding spaces to avoid partial matches
+          SEARCH_PATTERN=" $KUBECONTEXT "
+        fi
+
+        mapfile -t MATCHES < <(printf '%s\n' "$LOGIN_OUTPUT" | grep -F "System" | grep -F "$SEARCH_PATTERN" || true)
+        COUNT=${#MATCHES[@]}
+
+        if (( COUNT == 0 )); then
+          echo "Error: No matching context for '$KUBECONTEXT'."
+          exit 1
+        elif (( COUNT > 1 )); then
+          echo "Error: Multiple ($COUNT) contexts match '$KUBECONTEXT':"
+          exit 1
+        fi
+
+        RANCHER_SYSTEM_CONTEXT_INDEX=$(awk '{print $1}' <<<"${MATCHES[0]}")
+
+        if [[ ! $RANCHER_SYSTEM_CONTEXT_INDEX =~ ^[0-9]+$ ]]; then
+          echo "Error: Extracted context index '${RANCHER_SYSTEM_CONTEXT_INDEX}' is not numeric."
+          exit 1
+        fi
+
+        # Select the context
+        if ! printf '%s\n' "$RANCHER_SYSTEM_CONTEXT_INDEX" | rancher login "$RANCHER2_URL" -t "$RANCHER2_BEARER_TOKEN" >/dev/null 2>&1; then
+          echo "Error: Failed to activate context index $RANCHER_SYSTEM_CONTEXT_INDEX."
+          exit 1
+        fi
+      env:
+        KUBECONTEXT: ${{ inputs.context }}
+        RANCHER2_BEARER_TOKEN: ${{ inputs.access-key }}:${{ inputs.secret-key }}
+        RANCHER2_URL: ${{ inputs.url }}
+    - shell: bash
+      run: |
+        KUBECONTEXT="${{ inputs.context }}"
+        if [[ -n "$KUBECONTEXT" ]]
+        then
+          mkdir -p $HOME/.kube && rancher cluster kubeconfig ${{ inputs.context }} > $HOME/.kube/config
+        fi

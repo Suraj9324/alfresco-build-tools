@@ -1,0 +1,32 @@
+name: "Update chart version"
+description: "Update the version field in the Chart.yaml file"
+inputs:
+  new-version:
+    description: "The new version of the chart"
+    required: true
+  chart-dir:
+    description: "The relative path to the directory holding Chart.yaml"
+    required: true
+  chart-repository-dir:
+    description: "The path the git repository holding the chart project"
+    required: false
+  helm-docs-version:
+    description: 'Version of helm-docs'
+    required: false
+runs:
+  using: composite
+  steps:
+    - uses: $/.github/actions/setup-helm-docs
+      with:
+        version: ${{ inputs.helm-docs-version }}
+    - name: Update version
+      shell: bash
+      env:
+        CHART_REPO_DIR: ${{ inputs.chart-repository-dir }}
+      run: |
+        if [ -n "$CHART_REPO_DIR" ]
+        then
+          cd $CHART_REPO_DIR
+        fi
+        yq -i e '.version = "${{ inputs.new-version }}"' ${{ inputs.chart-dir }}/Chart.yaml
+        helm-docs

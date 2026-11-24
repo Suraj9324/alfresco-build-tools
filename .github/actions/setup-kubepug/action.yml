@@ -1,0 +1,16 @@
+name: "Setup Kubepug"
+description: "Install the Kubernetes preupgrade checker"
+inputs:
+  version:
+    description: The kubepug version to install
+    default: "1.7.1"
+    required: false
+runs:
+  using: "composite"
+  steps:
+    - uses: $/.github/actions/setup-github-release-binary
+      with:
+        repo: kubepug/kubepug
+        version: ${{ inputs.version }}
+        url_template: 'v${VERSION}/${NAME}_${OS}_${ARCH}.tar.gz'
+        test_args: 'version'

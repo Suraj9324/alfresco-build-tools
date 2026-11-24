@@ -1,0 +1,524 @@
+---
+title: Terraform in Alfresco CI
+---
+
+This document describes the Terraform approach to managing infrastructure as
+code (IaC) using Terraform. It outlines best practices, directory structure, and
+workflow automation for Terraform projects within the Alfresco organization.
+
+## Reusable workflow
+
+We are currently maintaining a reusable workflow which implements an opinionated
+workflow to manage terraform repositories leveraging the
+[dflook/terraform-github-actions](https://github.com/dflook/terraform-github-actions).
+
+The combination of dynamic stack/folder detection based on changed files and
+environment detection based on changed tfvars files for PRs targeting the
+default branch, and branch-based environment selection for other branches,
+allows for a flexible and automated workflow that adapts to different
+development and deployment scenarios. With this approach you can:
+
+- raise a PR with changes to a specific stack/folder and tfvars file to target a
+  specific environment
+- raise a PR with changes to a specific stack/folder without changing any tfvars file
+  to target the default environment for that stack
+- promote changes already merged to the default branch to other environments by
+  raising a PR to merge the default branch into the target environment branch.
+  Optionally use the [branch promotion workflow](#branch-promotion-workflow) to
+  automate this process.
+
+Or alternatively, you can always provide a specific stack/folder and environment
+as workflow inputs for a more controlled deployment (see `terraform_root_path`
+and `terraform_env` inputs below).
+
+### GitHub Environments
+
+GitHub Environments must be used to manage different deployment stacks (your
+infrastructure) and environments (e.g. dev, preprod, production) and their
+associated secrets and variables.
+
+You can provide a GitHub environment name with the `terraform_env` input to
+target a specific environment.
+
+When `terraform_env` is not explicitly set, the workflow will attempt to
+determine the environment dynamically by locating the first changed `.tfvars`
+file which matches the environment name. This detection applies to both pull
+requests and pushes against the **default branch**.
+
+If no `.tfvars` file is changed, the workflow will default to an environment
+named `<terraform_root_path>-dev` (e.g. `infra-dev` if `terraform_root_path` is
+`infra`), or to the value provided in the `terraform_default_env` input if set
+(e.g. `develop`).
+
+For branches that are not the default branch, the tfvars file matching will not
+be applied, and the workflow falls back to a branch-based environment approach,
+where: PRs and pushes targeting the `main` branch use the `production`
+environment, while all the other branches use the branch name as the environment
+(e.g. `develop` for the `develop` branch, `preprod` for the `preprod` branch,
+etc.).
+
+GitHub Environments must be configured with the following GitHub variables
+(repository or environment):
+
+- `RESOURCE_NAME`: used to namespace every resource created, e.g. State file in
+  the storage backend. You can use it as well inside Terraform by defining a
+  variable `resource_name` in your Terraform code.
+
+#### AWS S3 backend
+
+When using AWS S3 as the Terraform state backend, set the following variables:
+
+- `AWS_DEFAULT_REGION`: where the AWS resources will be created
+- `AWS_ROLE_ARN` (optional): the ARN of the role to assume in case OIDC
+  authentication is available
+- `TERRAFORM_STATE_BUCKET`: the name of the S3 bucket where to store the
+  terraform state. You can reuse the same bucket for multiple environments as
+  long as you provide a different `RESOURCE_NAME` for each environment.
+
+Alternatively to providing `AWS_ROLE_ARN` as GitHub variable, you can set
+`create_oidc_token_file` input to `true` to request an AWS OIDC token which will
+be persisted into a file and can be used inside terraform code e.g. like this:
+
+```tf
+backend "s3" {
+  assume_role_with_web_identity = {
+    role_arn                = "arn:aws:iam::372466110691:role/AlfrescoCI/alfresco-common-resources-deploy"
+    web_identity_token_file = "/github/workspace/idtoken.json"
+  }
+}
+```
+
+#### Azure Storage backend
+
+When using Azure Storage as the Terraform state backend, set the following
+variables:
+
+- `TERRAFORM_STATE_RESOURCE_GROUP`: the name of the Azure resource group
+  containing the storage account
+- `TERRAFORM_STATE_STORAGE_ACCOUNT`: the name of the Azure storage account where
+  to store the terraform state
+- `TERRAFORM_STATE_CONTAINER`: the name of the blob container within the storage
+  account
+
+The backend configuration is automatically constructed with `use_cli=true`,
+which means the `AZURE_CREDENTIALS` secret must be provided to authenticate via
+Azure CLI. The state file key is built using the pattern
+`<RESOURCE_NAME>/<terraform_root_path>/terraform.tfstate`.
+
+Your Terraform code should declare the `azurerm` backend:
+
+```tf
+backend "azurerm" {}
+```
+
+### GitHub Secrets
+
+The following GitHub secrets are accepted by this workflow. Most are optional,
+but some are required depending on the selected backend or authentication mode:
+
+- `AWS_ACCESS_KEY_ID`: (optional when using OIDC) access key to use the AWS terraform provider
+- `AWS_SECRET_ACCESS_KEY`: (optional when using OIDC) secret key to use the AWS terraform provider
+- `AZURE_CREDENTIALS`: (required for Azure) JSON object containing Azure service
+  principal credentials (`clientId`, `clientSecret`, `subscriptionId`, `tenantId`)
+- `BOT_GITHUB_TOKEN`: (optional) token to access private terraform modules in the
+  Alfresco org. Used as a fallback when `github_app_repo_owner` is not set.
+- `GITHUB_TOKEN_PRIVATE_KEY`: (optional) private key of the GitHub App used to
+  generate a token for accessing private terraform modules. Requires
+  `github_app_repo_owner` input and `github_app_token_client_id` input to be set.
+- `DOCKER_USERNAME` (optional): Docker Hub credentials
+- `DOCKER_PASSWORD` (optional): Docker Hub credentials
+- `RANCHER2_ACCESS_KEY` (optional): access key to use the rancher terraform
+  provider
+- `RANCHER2_SECRET_KEY` (optional): secret key to use the rancher terraform
+  provider
+
+Up to 10 additional custom secrets can be passed to the workflow using the
+`CUSTOM_SECRET_0` through `CUSTOM_SECRET_9` secrets. Each secret is made
+available as an environment variable in the terraform job under the same name
+(`CUSTOM_SECRET_0`, `CUSTOM_SECRET_1`, etc.).
+
+To use these secrets with a more meaningful name — for example to match the
+default environment variable names expected by a terraform provider — you can
+set additional [Environment variables](#environment-variables).
+
+### Tfvars files
+
+By default, the workflow will look for tfvars files in the root of the
+`terraform_root_path` folder. You can specify a different relative subfolder
+using the `tfvars_subfolder` input. It's highly recommended to use a `vars`
+subfolder to store your tfvars files.
+
+Having a shared `common.tfvars` file is required to define common variables
+across all environments, e.g. tags, resource names, etc. It can be a blank file
+if no common variables are needed.
+
+Any other tfvars file must be named after the GitHub environment name, e.g.
+`production.tfvars`, `develop.tfvars`, etc.
+
+When running against the default branch, the workflow will target the
+environment matching the first changed `.tfvars` file, or fallback to the
+default environment as per `terraform_default_env` input or
+`<terraform_root_path>-dev` convention if no tfvars file is changed.
+
+When running against any other branch, the workflow will target the environment
+matching the branch name (`base_ref` for `pull_request`, `ref_name` for `push`).
+
+### PR comments
+
+When the workflow is triggered by a PR comment, it will look for the presence of
+the strings `terraform plan` or `terraform apply` in the comment body to determine
+the requested operation. When both are present, `terraform plan` takes precedence.
+
+`issue_comment` events also fire for comments on plain issues, not just pull
+requests. When a comment requesting `terraform plan` or `terraform apply` is made
+on a plain issue, the request is silently skipped, without failing the workflow.
+
+Requesting `terraform plan` or `terraform apply` from a PR comment is allowed only
+while the pull request is still open, otherwise the workflow fails with an error.
+
+Requesting `terraform apply` additionally requires the pull request to be
+approved: the GitHub review decision must be `APPROVED`, which honours the
+required reviewers and `CODEOWNERS` rules configured through branch protection.
+This requires branch protection with required reviews to be enabled on the base
+branch; otherwise the review decision is never `APPROVED` and the operation is
+denied. This extra condition does not apply to `terraform plan`, since it is
+meant to be used to review changes before approving the pull request, nor to
+commenters with `admin` permission on the repository, who can trigger
+`terraform apply` on an open pull request regardless of its review decision.
+
+Any error while verifying the conditions above (for example a missing token
+permission) denies the operation.
+
+These restrictions do not apply to the `push` and `workflow_dispatch` triggers,
+which are guarded respectively by branch protection rules and by the repository
+Actions permissions. Enabling deployment protection rules on production
+environments is still recommended.
+
+The caller workflow must grant at least `pull-requests: read` to `GITHUB_TOKEN`
+(`pull-requests: write` is recommended anyway, as it is required to publish the
+plan output as a PR comment), otherwise the verification above cannot be
+performed and `terraform plan`/`terraform apply` from a PR comment is always
+denied.
+
+### Environment variables
+
+You can provide additional environment variables to the terraform execution by
+creating a file named `tfenv.yml` in the root of your terraform workspace,
+following the syntax supported by [env-load-from-yaml action](README.md#env-load-from-yaml)
+
+You can use this mechanism to give meaningful names to the [custom
+secrets](#github-secrets) passed to the workflow, for example to match the
+default environment variable names expected by a terraform provider.
+
+For example, to use the custom secrets as credentials for the [GitHub
+provider](https://registry.terraform.io/providers/integrations/github/latest/docs),
+you can set the following in `tfenv.yml`:
+
+```yaml
+env:
+  global:
+    - GITHUB_APP_ID=$CUSTOM_SECRET_0
+    - GITHUB_APP_INSTALLATION_ID=$CUSTOM_SECRET_1
+    - GITHUB_APP_PEM_FILE=$CUSTOM_SECRET_2
+```
+
+### Example usage
+
+An example workflow using this reusable workflow could look like this:
+
+```yaml
+name: "terraform"
+run-name: "terraform ${{ inputs.terraform_operation || (github.event_name == 'issue_comment' && 'run') || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_review') && 'plan' || 'apply') }} on ${{ github.event_name == 'issue_comment' && 'pr comment' || github.base_ref || github.ref_name }}"
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+      - preprod
+  push:
+    branches:
+      - main
+      - develop
+      - preprod
+  # optional - to trigger a terraform operation by adding a PR comment
+  # with text 'terraform plan' or 'terraform apply'
+  issue_comment:
+    types: [created]
+  # optional - to trigger manually from the Actions tab with a specific operation
+  workflow_dispatch:
+    inputs:
+      terraform_operation:
+        description: 'CAUTION: perform the requested operation with Terraform on the selected branch'
+        type: choice
+        required: true
+        options:
+          - plan
+          - apply
+          - destroy
+
+permissions:
+  pull-requests: write
+  contents: read
+  # id-token: write # required to use OIDC authentication with AWS
+
+jobs:
+  # Single job for all terraform folders/stacks, with dynamic detection of the root path
+  # and environment based on changed files in PRs/pushes against the default branch,
+  # or branch name for other branches.
+  invoke-terraform:
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform.yml@v19.17.0
+    with:
+      # Autodetected using the first changed folder (alphabetically) in PR/push
+      #
+      # terraform_root_path: my-subfolder
+
+      # Autodetected using the first changed tfvars file in PR/push,
+      # or by branch name for non-default branches.
+      #
+      # terraform_env: my-env
+
+      # Used as fallback if no tfvars file is changed in PR/push against the default branch
+      # Defaults to <terraform_root_path>-dev if not set
+      #
+      # terraform_default_env:
+
+      # Only needed for workflow_dispatch, auto-detected for PRs and pushes:
+      terraform_operation: ${{ inputs.terraform_operation }}
+
+      # Recommended to have a structured layout with tfvars files in a separate subfolder.
+      tfvars_subfolder: vars
+    secrets: inherit
+
+  # One job for a specific terraform folder/stack.
+  # Environment can still be auto-detected based on changed tfvars files or branch name.
+  invoke-terraform-infra:
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform.yml@v19.17.0
+    with:
+      terraform_root_path: infra
+      terraform_default_env: develop
+      terraform_operation: ${{ inputs.terraform_operation }}
+      tfvars_subfolder: vars
+    secrets: inherit
+
+  # Another job for a different terraform folder/stack
+  # which depends on the previous one if you want to ensure
+  # a specific execution order (e.g. infra before k8s).
+  invoke-terraform-k8s:
+    needs: invoke-terraform-infra
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform.yml@v19.17.0
+    with:
+      terraform_root_path: k8s
+      terraform_default_env: develop
+      terraform_operation: ${{ inputs.terraform_operation }}
+      tfvars_subfolder: vars
+      # Optionally install kubectl (see kubectl support section below)
+      # install_kubectl: true
+      # kubectl_version: v1.28.0  # optional - defaults to latest stable
+    secrets: inherit
+
+  # The most static approach with hardcoded terraform root path and environment,
+  # which can be useful for simple repositories with a single stack and environment,
+  # or for scheduled workflows.
+  invoke-terraform-static:
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform.yml@v19.17.0
+    with:
+      terraform_root_path: infra
+      terraform_env: production
+      terraform_operation: plan
+      tfvars_subfolder: vars
+
+  invoke-terraform-custom-secrets:
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform.yml@v19.17.0
+    with:
+      terraform_root_path: infra
+      terraform_default_env: develop
+      terraform_operation: ${{ inputs.terraform_operation }}
+      tfvars_subfolder: vars
+    # Pass up to 10 custom secrets to the workflow
+    secrets:
+      CUSTOM_SECRET_0: ${{ secrets.GITHUB_APP_ID }}
+      CUSTOM_SECRET_1: ${{ secrets.GITHUB_APP_INSTALLATION_ID }}
+      CUSTOM_SECRET_2: ${{ secrets.GITHUB_APP_PEM_FILE }}
+      # ...
+      # CUSTOM_SECRET_9: ${{ secrets.MY_CUSTOM_SECRET }}
+
+  # Azure Storage backend with GitHub App token for private terraform modules
+  invoke-terraform-aks:
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform.yml@v19.17.0
+    with:
+      terraform_root_path: infra
+      terraform_default_env: develop
+      terraform_operation: ${{ inputs.terraform_operation }}
+      tfvars_subfolder: envs
+      github_app_repo_owner: Alfresco
+      github_app_token_client_id: ${{ vars.MY_GITHUB_APP_CLIENT_ID }}
+    secrets:
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      GITHUB_TOKEN_PRIVATE_KEY: ${{ secrets.MY_GITHUB_APP_PRIVATE_KEY }}
+```
+
+### Terraform version
+
+Both the `terraform.yml` and `terraform-pre-commit.yml` workflows set the
+Terraform version in a single place: the `terraform_version` input, which
+defaults to `dependabot`, the version bundled in Dependabot's updater so that
+lockfile updates match CI. That version lives in
+`.github/actions/resolve-terraform-version/version`, and an updatecli job
+(`.updatecli/manifests/terraform_dependabot.yaml`) opens a PR to bump it
+whenever Dependabot moves to a newer Terraform.
+
+A repository can override it, in order of precedence:
+
+- a version pinned by the repository itself, which always wins over the input:
+  - `terraform.yml`: a version set in a remote/cloud workspace, or a
+    `required_version` constraint, `.tfswitchrc`, `.terraform-version` or
+    `.tool-versions` file in the root module
+  - `terraform-pre-commit.yml`: a `.terraform-version` file at the repository
+    root, kept for backward compatibility
+- the `terraform_version` input (`dependabot`, a version or a constraint like
+  `~> 1.14`); an empty string falls back to the latest release
+  (`terraform.yml` first uses the version that last wrote the state)
+
+To keep CI aligned with Dependabot, avoid `required_version` in the root
+module. When it is present, the workflow prints a warning annotation, because
+the constraint silently overrides the `terraform_version` input.
+
+```yaml
+jobs:
+  invoke-terraform:
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform.yml@v19.17.0
+    with:
+      # optional - defaults to the Dependabot version, does not override a
+      # version configured in a remote/cloud workspace
+      terraform_version: 1.15.0
+    secrets: inherit
+```
+
+### kubectl support
+
+The terraform workflow can optionally install `kubectl` CLI tool to make it
+available during terraform execution. This is useful when you need to interact
+with Kubernetes clusters as part of your terraform provisioning
+e.g. in a `null_resource`.
+
+You can enable kubectl installation by setting the `install_kubectl` input to
+`true`. By default, this will install the latest stable version of kubectl.
+
+If you need a specific version, you can specify it using the `kubectl_version`
+input. The version should be provided in the format `vX.Y.Z` (e.g., `v1.28.0`).
+
+Example:
+
+```yaml
+jobs:
+  invoke-terraform-k8s:
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform.yml@v19.17.0
+    with:
+      terraform_root_path: k8s
+      install_kubectl: true
+      kubectl_version: v1.28.0  # optional - defaults to latest stable
+    secrets: inherit
+```
+
+## pre-commit config
+
+Each terraform repository should have a `.pre-commit-config.yaml` file in the
+root directory with the following configuration:
+
+```yaml
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-json
+      - id: check-xml
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.97.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_docs
+        args:
+          - --hook-config=--path-to-file=README.md
+          - --hook-config=--add-to-existing-file=true
+          - --hook-config=--create-file-if-not-exist=true
+      - id: terraform_tflint
+      - id: terraform_providers_lock
+        args:
+        - --hook-config=--mode=only-check-is-current-lockfile-cross-platform
+        - --args=-platform=linux_amd64
+        - --args=-platform=darwin_amd64
+        - --args=-platform=darwin_arm64
+      - id: terraform_checkov
+```
+
+The pre-commit workflow should look like this:
+
+```yaml
+name: pre-commit
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - ...
+  push:
+    branches:
+      - develop
+      - ...
+
+permissions:
+  contents: write
+
+jobs:
+  pre-commit:
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform-pre-commit.yml@v19.17.0
+    with:
+      BOT_GITHUB_USERNAME: ${{ vars.BOT_GITHUB_USERNAME }}
+    secrets: inherit
+```
+
+### Authenticating to private terraform modules
+
+When the terraform code references modules in private GitHub repositories, the
+workflow needs credentials to fetch them. Two authentication modes are supported:
+
+- **GitHub App (recommended):** set the `github_app_repositories_owner` and
+  `github_app_client_id` inputs and provide the `GITHUB_APP_PRIVATE_KEY`
+  secret. The workflow generates a short-lived installation token for the App
+  installation on `github_app_repositories_owner` and rewrites git URLs for
+  `github.com/<owner>` to use it. Optionally set `github_app_repositories` to
+  scope the token to specific repositories; when omitted, the token can access
+  all repositories the App installation is granted.
+- **Bot token (fallback):** set the `BOT_GITHUB_USERNAME` input and provide the
+  `BOT_GITHUB_TOKEN` secret. The workflow rewrites all `github.com` git URLs to use
+  these credentials.
+
+If both modes are configured, the GitHub App token takes precedence.
+
+Example using the GitHub App authentication mode:
+
+```yaml
+jobs:
+  pre-commit:
+    uses: Alfresco/alfresco-build-tools/.github/workflows/terraform-pre-commit.yml@v19.17.0
+    with:
+      github_app_repositories_owner: Alfresco
+      github_app_client_id: ${{ vars.MY_GITHUB_APP_CLIENT_ID }}
+    secrets:
+      GITHUB_APP_PRIVATE_KEY: ${{ secrets.MY_GITHUB_APP_PRIVATE_KEY }}
+```
+
+## Branch promotion workflow
+
+For Terraform projects with multiple environment branches, you can use the
+branch promotion workflow to automate the creation of pull requests when
+promoting changes across environments.
+
+See [main documentation](README.md#branch-promotion-prs) for usage
+documentation.

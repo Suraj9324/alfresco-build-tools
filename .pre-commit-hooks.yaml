@@ -1,0 +1,45 @@
+- id: helm-deps
+  name: Helm Dependency Update
+  entry: bash -c 'find . -name Chart.yaml | xargs -I% bash -c "dirname %" | xargs -t -I% helm dep up %'
+  language: system
+  pass_filenames: false
+- id: helm-deps-build
+  name: Helm Dependency Build
+  entry: bash -c 'find . -name Chart.yaml | xargs -I% bash -c "dirname %" | xargs -t -I% helm dep build %'
+  language: system
+  pass_filenames: false
+- id: helm-lint
+  name: Helm Lint
+  entry: bash -c 'find . -name Chart.yaml | xargs -I% bash -c "dirname %" | xargs -t -I% helm lint %'
+  language: system
+  pass_filenames: false
+- id: kubepug-minimum
+  name: KubePug - k8s v1.15 minimum
+  entry: bash -c 'find . -name Chart.yaml | xargs -I% bash -c "dirname %" | xargs -t -I% bash -c "helm template % --kube-version 1.15 | kubepug --error-on-deprecated --error-on-deleted --k8s-version v1.15.0 --input-file=-"'
+  language: system
+  pass_filenames: false
+- id: kubepug-recommended
+  name: KubePug - k8s v1.21 recommended
+  entry: bash -c 'find . -name Chart.yaml | xargs -I% bash -c "dirname %" | xargs -t -I% bash -c "helm template % --kube-version 1.21 | kubepug --error-on-deprecated --error-on-deleted --k8s-version v1.21.0 --input-file=-"'
+  language: system
+  pass_filenames: false
+- id: kubepug-latest
+  name: KubePug - k8s latest
+  entry: bash -c 'find . -name Chart.yaml | xargs -I% bash -c "dirname %" | xargs -t -I% bash -c "helm template % | kubepug --error-on-deprecated --error-on-deleted --input-file=-"'
+  language: system
+  pass_filenames: false
+- id: md-toc
+  name: Markdown Table of Contents
+  entry: >-
+    bash -eu -o pipefail -c
+    "MDTOC_ARGS=\"\";
+    for f in $@; do
+      [[ \"x$f\" = x--* ]] && MDTOC_ARGS=\"$f $MDTOC_ARGS\" && continue;
+      [ -f \"$f\" ] && markdown-toc $MDTOC_ARGS -i $f;
+    done"
+  language: system
+- id: check-readme-missing-entries
+  name: Check README entries
+  language: script
+  entry: .github/scripts/check_readme.sh
+  pass_filenames: false

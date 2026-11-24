@@ -1,0 +1,112 @@
+name: Python Tests
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - ".github/actions/**/action.yml"
+      - ".github/actions/**/*.py"
+      - ".github/actions/**/requirements.txt"
+      - ".github/scripts/*.py"
+      - ".github/tests/python-scripts/**"
+      - ".github/workflows/test-with-python.yml"
+  pull_request:
+    branches: [ master ]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - ".github/actions/**/action.yml"
+      - ".github/actions/**/*.py"
+      - ".github/actions/**/requirements.txt"
+      - ".github/scripts/*.py"
+      - ".github/tests/python-scripts/**"
+      - ".github/workflows/test-with-python.yml"
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      has_tests: ${{ steps.resolve.outputs.has_tests }}
+      matrix_json: ${{ steps.resolve.outputs.matrix_json }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: List changes
+        id: changes
+        uses: ./.github/actions/github-list-changes
+
+      - name: Resolve impacted python action tests
+        id: resolve
+        env:
+          CHANGED: ${{ steps.changes.outputs.all_changed_files }}
+        run: |
+          printf "%s\n" "$CHANGED" > changed_files.txt
+          ./.github/scripts/resolve-python-action-tests.sh < changed_files.txt
+
+      - name: Debug
+        run: |
+          echo "has_tests=${{ steps.resolve.outputs.has_tests }}"
+          echo '${{ steps.resolve.outputs.matrix_json }}'
+
+  tests:
+    name: ${{ matrix.action }}
+    needs: resolve
+    if: needs.resolve.outputs.has_tests == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix_json) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f ".github/actions/${{ matrix.action }}/requirements.txt" ]; then
+            python -m pip install -r .github/actions/${{ matrix.action }}/requirements.txt
+          fi
+          if [ -f ".github/tests/python-scripts/${{ matrix.action }}/dev-requirements.txt" ]; then
+            python -m pip install -r .github/tests/python-scripts/${{ matrix.action }}/dev-requirements.txt
+          fi
+
+      - name: Decide pytest markers from PR labels
+        id: decide_markers
+        run: ./.github/scripts/decide-pytest-markers.sh
+
+      - name: Run tests for ${{ matrix.action }}
+        working-directory: .github/tests/python-scripts/${{ matrix.action }}
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_USER: ${{ secrets.JIRA_USER }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          echo "Selected test mode: ${{ steps.decide_markers.outputs.mode }}"
+          echo "Selected pytest -m: ${{ steps.decide_markers.outputs.marker }}"
+          python -m pytest -m "${{ steps.decide_markers.outputs.marker }}"
+
+      - name: Publish test report
+        uses: dorny/test-reporter@d1b5dff021aa968b288b02285a8bf47471c5928a # v3.2.0
+        if: ${{ !cancelled() }}
+        with:
+          working-directory: ${{ matrix.tests_dir }}
+          name: ${{ matrix.action }}
+          path: report.xml
+          reporter: java-junit

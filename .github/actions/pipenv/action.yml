@@ -1,0 +1,43 @@
+name: pipenv
+description: 'Install python packages with pipenv'
+inputs:
+  python-version:
+    description: The python version
+    required: false
+    default: "3.11"
+  enable-dev:
+    description: Whether to install dev packages (--dev flag)
+    required: false
+    default: "true"
+  categories:
+    description: >-
+      Comma-separated list of additional Pipfile categories to install
+      (e.g. "lint,test"). Translates to --categories for pipenv install.
+    required: false
+    default: ""
+outputs:
+  pipenv-root:
+    description: >-
+      Root directory where the virtual environment has been created (where the
+      Pipfile sits)
+    value: ${{ steps.pipenv.outputs.pipenv-root }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install pipenv dependency
+      shell: bash
+      run: pip install -r ${{ github.action_path }}/requirements.txt
+    - name: Prepare pipenv virtualenv
+      id: pipenv
+      shell: bash
+      run: |
+        PIPENV_ARGS=(--deploy --python "${{ inputs.python-version }}")
+        if [[ "${{ inputs.enable-dev }}" == "true" ]]; then
+          PIPENV_ARGS+=(--dev)
+        fi
+        if [[ -n "${{ inputs.categories }}" ]]; then
+          PIPENV_ARGS+=(--categories="${{ inputs.categories }}")
+        fi
+        pipenv install "${PIPENV_ARGS[@]}"
+        echo "pipenv-root=$(pwd)" >> $GITHUB_OUTPUT

@@ -1,0 +1,33 @@
+name: 'Calculate next internal version'
+description: 'Calculate next internal version based on existing tags'
+inputs:
+  next-version:
+    description: 'Next version following the pattern MAJOR.MINOR.PATCH'
+    required: true
+  prerelease-type:
+    description: The type of the prerelease, i.e. `alpha`, `beta`, `rc`
+    required: false
+    default: alpha
+  repository-directory:
+    description: "Path to the directory holding the git repository"
+    required: false
+
+outputs:
+  next-prerelease:
+    description: "Next prerelease"
+    value: ${{ steps.next-prerelease-resolver.outputs.next-prerelease }}
+  latest-prerelease:
+    description: "Latest prerelease version found"
+    value: ${{ steps.next-prerelease-resolver.outputs.latest-prerelease }}
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+    - uses: $/.github/actions/setup-pysemver
+    - id: next-prerelease-resolver
+      run: ${{ github.action_path }}/next-prerelease.sh
+      shell: bash
+      env:
+        NEXT_VERSION: ${{ inputs.next-version }}
+        PRERELEASE_TYPE: ${{ inputs.prerelease-type }}
+        REPO_DIR: ${{inputs.repository-directory}}

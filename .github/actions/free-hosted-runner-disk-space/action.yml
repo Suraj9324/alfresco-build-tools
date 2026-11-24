@@ -1,0 +1,147 @@
+name: Free GHA runner disk space
+description: Frees up disk space on GitHub Actions hosted runners by removing unneeded software.
+inputs:
+  remove-dotnet:
+    description: Removes .NET runtime and libraries
+    required: false
+    default: 'true'
+  remove-haskell:
+    description: Removes GHC (Haskell) artifacts
+    required: false
+    default: 'true'
+  remove-tools-cache:
+    description: Removes tools and dependencies cached
+    required: false
+    default: 'true'
+  remove-android:
+    description: Removes Android SDKs and Tools
+    required: false
+    default: 'true'
+  remove-codeql:
+    description: Removes CodeQL Action Bundles
+    required: false
+    default: 'true'
+  remove-swift:
+    description: Removes Swift toolchain and libraries
+    required: false
+    default: 'true'
+  remove-powershell:
+    description: Removes PowerShell Core installation
+    required: false
+    default: 'true'
+  remove-docker-images:
+    description: Removes cached Docker images
+    required: false
+    default: 'false'
+  remove-paths:
+    description: Additional collection of files/folders to be removed, separated by spaces
+    default: ''
+    required: false
+  diagnose-top-offenders-enabled:
+    description: Runs diagnostic steps to list top disk space offenders before and after cleanup, and reports the size of each folder before it is removed
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Runner system report before modification
+      shell: bash
+      run: |
+        echo "Memory and swap:"
+        free -m
+        echo
+
+        echo "Available storage:"
+        df -h
+        echo
+
+    - name: Run optional diagnostic of top offenders before cleanup
+      if: inputs.diagnose-top-offenders-enabled == 'true'
+      run: |
+        sudo du -h --max-depth=4 /usr /opt | sort -hr 2>/dev/null | head -n 20 || true
+      shell: bash
+
+    - name: Remove unwanted software
+      env:
+        DOTNET_ROOT: /usr/share/dotnet
+        ANDROID_ROOT: /usr/local/lib/android
+        HASKELL_ROOT: /usr/local/.ghcup
+        CODEQL_ROOT: /opt/hostedtoolcache/CodeQL
+        SWIFT_ROOT: /usr/share/swift
+        POWERSHELL_ROOT: /usr/local/share/powershell
+      run: |
+        diagnose="${{ inputs.diagnose-top-offenders-enabled }}"
+        overall_start=$(date +%s)
+        pids=()
+
+        remove_in_background() {
+          local label="$1" path="$2" keep_dir="${3:-}"
+          if [[ -d "$path" ]]; then
+            echo "Removing $label ($path) in the background..."
+            [[ "$diagnose" == 'true' ]] && du -sh "$path" 2>/dev/null || true
+            if [[ "$keep_dir" == '--keep-dir' ]]; then
+              sudo bash -c 'shopt -s dotglob nullglob; rm -rf -- "$1"/*' _ "$path" &
+            else
+              sudo rm -rf "$path" &
+            fi
+            pids+=("$!")
+          else
+            echo "$path not found, skipping $label"
+          fi
+        }
+
+        [[ ${{ inputs.remove-dotnet }} == 'true' ]] && remove_in_background ".NET runtime and libraries" "$DOTNET_ROOT"
+        [[ ${{ inputs.remove-android }} == 'true' ]] && remove_in_background "Android SDKs and Tools" "$ANDROID_ROOT"
+        [[ ${{ inputs.remove-haskell }} == 'true' ]] && remove_in_background "GHC (Haskell) artifacts" "$HASKELL_ROOT"
+        [[ ${{ inputs.remove-codeql }} == 'true' ]] && remove_in_background "CodeQL Action Bundles" "$CODEQL_ROOT"
+        [[ ${{ inputs.remove-swift }} == 'true' ]] && remove_in_background "Swift toolchain and libraries" "$SWIFT_ROOT"
+        [[ ${{ inputs.remove-powershell }} == 'true' ]] && remove_in_background "PowerShell Core installation" "$POWERSHELL_ROOT"
+        # Some actions assume the folder always exists on the hosted runner
+        [[ ${{ inputs.remove-tools-cache }} == 'true' ]] && remove_in_background "tools and dependencies cache" "$AGENT_TOOLSDIRECTORY" --keep-dir
+
+        if [[ ${{ inputs.remove-docker-images }} == 'true' ]]; then
+          echo "Removing cached Docker images in the background..."
+          sudo docker image prune --all --force &
+          pids+=("$!")
+        fi
+
+        to_remove="${{ inputs.remove-paths }}"
+        if [[ -n "$to_remove" ]]; then
+          for item in $to_remove; do
+            echo "Removing $item in the background..."
+            [[ "$diagnose" == 'true' ]] && du -sh "$item" 2>/dev/null || true
+            sudo rm -rf "$item" &
+            pids+=("$!")
+          done
+        fi
+
+        failed=0
+        for pid in "${pids[@]}"; do
+          wait "$pid" || failed=1
+        done
+
+        overall_end=$(date +%s)
+        echo "Done removing unwanted software in $((overall_end - overall_start)) seconds."
+
+        if [[ "$failed" -eq 1 ]]; then
+          echo "One or more removal commands failed." >&2
+          exit 1
+        fi
+      shell: bash
+
+    - name: Run optional diagnostic of top offenders after cleanup
+      if: inputs.diagnose-top-offenders-enabled == 'true'
+      run: |
+        sudo du -h --max-depth=4 /usr /opt | sort -hr 2>/dev/null | head -n 20 || true
+      shell: bash
+
+    - name: Runner system report after cleanup
+      run: |
+        echo "Memory and swap:"
+        free -m
+        echo
+
+        echo "Available storage:"
+        df -h
+      shell: bash

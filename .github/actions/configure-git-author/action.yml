@@ -1,0 +1,24 @@
+name: "configure-git-author"
+description: "Configure the git identity"
+inputs:
+  username:
+    description: "Git username"
+    required: true
+  email:
+    description: "Email"
+    required: true
+  global:
+    description: "Global scope"
+    required: false
+    default: 'false'
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      run: |
+        GIT_GLOBAL_OPTION=''
+        if [ ${{ inputs.global }} = true ] ; then
+           GIT_GLOBAL_OPTION='--global'
+        fi
+        git config $GIT_GLOBAL_OPTION user.name ${{ inputs.username }}
+        git config $GIT_GLOBAL_OPTION user.email ${{ inputs.email }}

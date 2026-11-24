@@ -1,0 +1,439 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  pull_request_review:
+      types: [ submitted ]
+
+jobs:
+  build:
+    # Trigger a run when approving a bot PR or as usual
+    if: >-
+      (github.event.review.state == 'approved' && contains(fromJSON('["dependabot[bot]", "github-actions[bot]"]'), github.event.pull_request.user.login)) ||
+      (github.actor != 'dependabot[bot]' && github.event_name != 'pull_request_review')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: pre-commit checks
+        uses: ./.github/actions/pre-commit
+        with:
+          require-frozen-revs: "true"
+      - name: Ensure SHA pinned actions
+        uses: hyland/github-actions-ensure-sha-pinned-actions@9f71a10c9852b115cfcb146ec2d8d09e2b89593f # v2.1.1
+  test:
+    runs-on: ${{ matrix.os }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test HTTP latency
+        uses: ./.github/actions/http-latency
+        with:
+          url: https://repo1.maven.org/maven2/
+          warmup: 1
+          iterations: 5
+
+      - name: Test AWF with disallowed domain
+        uses: ./.github/actions/awf-run-command
+        if: runner.arch != 'ARM64'
+        id: awf-test-failure
+        continue-on-error: true
+        with:
+          allowed-domains: hyland.com
+          command: curl -sSf https://www.google.com
+          agent-timeout: 1
+
+      - name: Assert that command failed due to AWF restrictions
+        if: steps.awf-test-failure.outcome != 'failure' && runner.arch != 'ARM64'
+        run: |
+          echo "Previous command should have failed due to AWF restrictions!" && exit 1
+
+      - name: Test AWF with allowed domain
+        uses: ./.github/actions/awf-run-command
+        if: runner.arch != 'ARM64'
+        with:
+          allowed-domains: hyland.com
+          command: curl -sSf https://www.hyland.com
+          agent-timeout: 1
+
+      # free-hosted-runner-disk-space action usage and test
+      - name: Check available disk space before running free-hosted-runner-disk-space action
+        id: free-hosted-runner-disk-space
+        run: echo "total_size_before=$(df --total --output=avail | tail -1)" >> "$GITHUB_OUTPUT"
+      - name: Free up disk space on the runner
+        uses: ./.github/actions/free-hosted-runner-disk-space
+        with:
+          diagnose-top-offenders-enabled: 'true'
+      - name: Assert that space available on the runner has increased
+        env:
+          TOTAL_SIZE_BEFORE: ${{ steps.free-hosted-runner-disk-space.outputs.total_size_before }}
+        run: test "$TOTAL_SIZE_BEFORE" -lt "$(df --total --output=avail | tail -1)"
+      - name: Assert that the tool cache is empty but still exists
+        run: |
+          test -w "$RUNNER_TOOL_CACHE"
+          test -z "$(ls -A "$RUNNER_TOOL_CACHE")"
+
+      #region Test setup-helm-docs
+      - uses: ./.github/actions/setup-helm-docs
+        id: setup-helm-docs-latest
+      - uses: ./.github/tests/actions/test-setup-helm-docs
+        with:
+          expected-version: ${{ steps.setup-helm-docs-latest.outputs.version }}
+      - uses: ./.github/actions/setup-helm-docs
+        id: setup-helm-docs-fixed-version
+        with:
+          version: 1.13.1
+      - uses: ./.github/tests/actions/test-setup-helm-docs
+        with:
+          expected-version: ${{ steps.setup-helm-docs-fixed-version.outputs.version }}
+      #endregion
+
+      #region Test setup-helm
+      - uses: ./.github/actions/setup-helm
+        id: setup-helm-version
+        with:
+          version: 3.19.0
+      - name: Check helm version from version input
+        run: |
+          [ "${{ steps.setup-helm-version.outputs.version }}" = "3.19.0" ]
+          [ "$(helm version --template '{{ .Version }}')" = "v3.19.0" ]
+      - name: Create .tool-versions for setup-helm
+        run: printf 'nodejs 24.11.0\nhelm 4.2.3\n' > "$RUNNER_TEMP/.tool-versions"
+      - uses: ./.github/actions/setup-helm
+        id: setup-helm-version-file
+        with:
+          version-file: ${{ runner.temp }}/.tool-versions
+      - name: Check helm version from version-file input
+        run: |
+          [ "${{ steps.setup-helm-version-file.outputs.version }}" = "4.2.3" ]
+          [ "$(helm version --template '{{ .Version }}')" = "v4.2.3" ]
+      #endregion
+
+      #region Test setup-maven
+      - uses: ./.github/actions/setup-maven
+        with:
+          version: 3.10.0
+      - uses: ./.github/tests/actions/test-setup-maven
+        with:
+          expected-version: 3.10.0
+
+      - uses: ./.github/actions/setup-maven
+        with:
+          version: 3.9.16
+      - uses: ./.github/tests/actions/test-setup-maven
+        with:
+          expected-version: 3.9.16
+
+      - name: Test setup-maven rejects invalid version
+        id: setup-maven-invalid
+        continue-on-error: true
+        uses: ./.github/actions/setup-maven
+        with:
+          version: not-a-version
+      - name: Assert setup-maven failed on invalid version
+        if: steps.setup-maven-invalid.outcome != 'failure'
+        run: |
+          echo "setup-maven should fail when given an invalid version"
+          exit 1
+      #endregion
+
+      #region Test maven-configure
+      - uses: ./.github/actions/maven-configure
+        id: maven-configure
+        with:
+          java-version: 17
+          maven-version: 3.10.0
+      - uses: ./.github/tests/actions/test-maven-configure
+        with:
+          maven-options: ${{ steps.maven-configure.outputs.maven-options }}
+          skip-tests: ${{ steps.maven-configure.outputs.skip-tests }}
+      #endregion
+
+      - uses: ./.github/actions/setup-jx-release-version
+      - uses: ./.github/actions/setup-kubepug
+      - uses: ./.github/actions/rancher
+        if: ${{ ! github.event.pull_request.head.repo.fork && github.actor != 'dependabot[bot]' && matrix.os == 'ubuntu-latest' }}
+        with:
+          rancher-url: ${{ vars.RANCHER_OPSEXP_URL }}
+          rancher-access-key: ${{ secrets.RANCHER_OPSEXP_ACCESS_KEY }}
+          rancher-secret-key: ${{ secrets.RANCHER_OPSEXP_SECRET_KEY }}
+          cluster-name: "fake_cluster"
+          action: "detach"
+      - uses: ./.github/actions/setup-rancher-cli
+        if: ${{ ! github.event.pull_request.head.repo.fork && github.actor != 'dependabot[bot]' && matrix.os == 'ubuntu-latest' }}
+        with:
+          url: ${{ vars.RANCHER_OPSEXP_URL }}
+          access-key: ${{ secrets.RANCHER_OPSEXP_ACCESS_KEY }}
+          secret-key: ${{ secrets.RANCHER_OPSEXP_SECRET_KEY }}
+          context: local
+      - uses: ./.github/actions/setup-updatebot
+      - uses: ./.github/actions/setup-pysemver
+      - uses: ./.github/actions/calculate-next-internal-version
+        with:
+          next-version: 7.3.0
+      - uses: ./.github/actions/resolve-preview-name
+      - uses: ./.github/actions/setup-terraform-docs
+      - uses: ./.github/actions/setup-kcadm
+      - uses: ./.github/actions/env-load-from-yaml
+        env:
+          SOURCE_MULTILINE: |
+            -----BEGIN RSA PRIVATE KEY-----
+            line one
+            line two
+            -----END RSA PRIVATE KEY-----
+        with:
+          ignore_regex: ^TRAVIS_BRANCH=.*
+          yml_path: ./.github/tests/env-load-from-yaml/env.yml
+      - name: Test env-load-from-yaml
+        run: |
+          if [ -z "$APP_SETTING_ONE" ]; then
+            echo APP_SETTING_ONE should be set!
+            exit 1
+          fi
+          if [ -n "$TRAVIS_BRANCH" ]; then
+            echo TRAVIS_BRANCH should not be set!
+            exit 1
+          fi
+          if [[ "$PEM" != *$'\n'* ]]; then
+            echo PEM should be multiline!
+            exit 1
+          fi
+          if [[ "$PEM" != *"-----BEGIN RSA PRIVATE KEY-----"* ]]; then
+            echo PEM should contain the BEGIN line!
+            exit 1
+          fi
+          if [[ "$PEM" != *"-----END RSA PRIVATE KEY-----"* ]]; then
+            echo PEM should contain the END line!
+            exit 1
+          fi
+
+      - name: Generate test GPG key
+        id: test-gpg-key
+        shell: bash
+        run: |
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+
+          cat > key-params <<'EOF'
+          Key-Type: RSA
+          Key-Length: 2048
+          Subkey-Type: RSA
+          Subkey-Length: 2048
+          Name-Real: CI Test Key
+          Name-Email: ci@example.com
+          Expire-Date: 0
+          Passphrase: correct horse battery staple
+          %commit
+          EOF
+
+          gpg --batch --pinentry-mode loopback --passphrase 'correct horse battery staple' --generate-key key-params
+          gpg --batch --pinentry-mode loopback --passphrase 'correct horse battery staple' --armor --export-secret-keys ci@example.com > test-private.key
+
+          {
+            echo 'private-key<<EOF'
+            cat test-private.key
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Test import-gpg-key success path
+        env:
+          HOME: ${{ runner.temp }}/gpg-success-home
+        uses: ./.github/actions/import-gpg-key
+        with:
+          gpg-signing-private-key: ${{ steps.test-gpg-key.outputs.private-key }}
+          gpg-signing-passphrase: correct horse battery staple
+
+      - name: Test import-gpg-key failure path
+        id: import-gpg-key-failure
+        continue-on-error: true
+        env:
+          HOME: ${{ runner.temp }}/gpg-failure-home
+        uses: ./.github/actions/import-gpg-key
+        with:
+          gpg-signing-private-key: ${{ steps.test-gpg-key.outputs.private-key }}
+          gpg-signing-passphrase: wrong passphrase
+
+      - name: Assert import-gpg-key failed on wrong passphrase
+        if: steps.import-gpg-key-failure.outcome != 'failure'
+        run: |
+          echo "import-gpg-key should fail when the passphrase is wrong"
+          exit 1
+
+      - name: Test import-gpg-key isolated GNUPGHOME path
+        env:
+          HOME: ${{ runner.temp }}/gpg-isolated-home
+        uses: ./.github/actions/import-gpg-key
+        with:
+          gpg-signing-private-key: ${{ steps.test-gpg-key.outputs.private-key }}
+          gpg-signing-passphrase: correct horse battery staple
+          use-temporary-gpg-home: true
+
+      - name: Assert import-gpg-key isolated GNUPGHOME path
+        env:
+          HOME: ${{ runner.temp }}/gpg-isolated-home
+        run: |
+          [[ -n "$GNUPGHOME" ]]
+          [[ -d "$GNUPGHOME" ]]
+          [[ ! -f "$HOME/.gnupg/gpg.conf" ]]
+          [[ ! -f "$HOME/.gnupg/gpg-agent.conf" ]]
+          gpg --homedir "$GNUPGHOME" --batch --list-secret-keys | grep -q 'ci@example.com'
+
+      - uses: ./.github/actions/setup-checkov
+      - uses: ./.github/actions/setup-fluxcli
+      - uses: ./.github/actions/setup-updatecli
+      - uses: ./.github/actions/setup-github-release-binary
+        with:
+          repo: updatecli/updatecli
+          version: 0.93.0
+          url_template: 'v${VERSION}/${NAME}_${OS}_${ARCH}.tar.gz'
+          test_args: 'version'
+          x86_64_arch: 'x86_64'
+
+      - uses: ./.github/actions/xvfb-record
+        with:
+          test_command: echo "Running Nuxeo image builder tests..."
+          timeout_minutes: 30
+          video_name: "nuxeo_image_test_run-${{ matrix.os }}"
+          video_extension: "mp4"
+          max_attempts: 1
+          retry_on: error
+
+      # region Test get-commit-message
+      - uses: ./.github/actions/get-commit-message
+        id: get-full-commit-message
+
+      - name: Test full commit message
+        env:
+          COMMIT_MSG_OUTPUT: ${{ steps.get-full-commit-message.outputs.COMMIT_MESSAGE }}
+          COMMIT_MSG_ENV: ${{ env.COMMIT_MESSAGE }}
+        run: |
+          echo "Full commit message (output): $COMMIT_MSG_OUTPUT"
+          echo "Full commit message (env): $COMMIT_MSG_ENV"
+          [ -n "$COMMIT_MSG_OUTPUT" ] || { echo "::error::full commit message output is empty"; exit 1; }
+          [ -n "$COMMIT_MSG_ENV" ] || { echo "::error::full commit message env is empty"; exit 1; }
+
+      - uses: ./.github/actions/get-commit-message
+        id: get-commit-message-header-only
+        with:
+          header-only: true
+
+      - name: Test commit message header
+        env:
+          COMMIT_MSG_OUTPUT: ${{ steps.get-full-commit-message.outputs.COMMIT_MESSAGE }}
+          COMMIT_MSG_HEADER_OUTPUT: ${{ steps.get-commit-message-header-only.outputs.COMMIT_MESSAGE }}
+          COMMIT_MSG_HEADER_ENV: ${{ env.COMMIT_MESSAGE }}
+        run: |
+          echo "Full commit message header (output): $COMMIT_MSG_HEADER_OUTPUT"
+          echo "Full commit message header (env): $COMMIT_MSG_HEADER_ENV"
+          # header-only must be exactly the first line of the full message
+          EXPECTED=${COMMIT_MSG_OUTPUT%%$'\n'*}
+          if [ "$COMMIT_MSG_HEADER_OUTPUT" != "$EXPECTED" ] || [ "$COMMIT_MSG_HEADER_ENV" != "$EXPECTED" ]; then
+            echo "Expected first line: $EXPECTED"
+            echo "Header output:       $COMMIT_MSG_HEADER_OUTPUT"
+            echo "Header env:          $COMMIT_MSG_HEADER_ENV"
+            echo "::error::header-only commit message does not match first line of full message"
+            exit 1
+          fi
+      # endregion
+
+      # region github-close-orphaned-preview-prs
+      # The label prefix is deliberately one that matches nothing, so the PR
+      # listing comes back empty and no PR is ever closed. The fixture resolves to
+      # this repository, so the default GITHUB_TOKEN read access is enough and no
+      # other repo is touched.
+      - uses: $/.github/actions/github-close-orphaned-preview-prs
+        id: github-close-orphaned-derived
+        with:
+          source-pr-number: "1"
+          source-pr-state: MERGED
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          updatebot-config: .github/tests/github-close-orphaned-preview-prs/updatebot-preview.yaml
+          label-prefix: github-close-orphaned-preview-prs-test-no-match-
+
+      - uses: $/.github/actions/github-close-orphaned-preview-prs
+        id: github-close-orphaned-explicit
+        with:
+          source-pr-number: "1"
+          source-pr-state: CLOSED
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          downstream-repos: |
+            https://github.com/Alfresco/alfresco-build-tools.git
+            Alfresco/alfresco-build-tools/
+          label-prefix: github-close-orphaned-preview-prs-test-no-match-
+
+      - name: Assert github-close-orphaned-preview-prs resolved its downstream repos
+        env:
+          DERIVED: ${{ steps.github-close-orphaned-derived.outputs.downstream-repos }}
+          DERIVED_COUNT: ${{ steps.github-close-orphaned-derived.outputs.closed-count }}
+          EXPLICIT: ${{ steps.github-close-orphaned-explicit.outputs.downstream-repos }}
+          EXPLICIT_COUNT: ${{ steps.github-close-orphaned-explicit.outputs.closed-count }}
+        run: |
+          # Both inputs describe the same repository in different spellings, so
+          # normalisation and de-duplication must collapse them to a single entry.
+          expected="Alfresco/alfresco-build-tools"
+          status=0
+          check() {
+            echo "$1: repos='$2' closed-count='$3'"
+            if [ "$2" != "$expected" ]; then
+              echo "::error::$1 resolved '$2', expected '$expected'"
+              status=1
+            fi
+            if [ "$3" != "0" ]; then
+              echo "::error::$1 closed-count is '$3', expected 0"
+              status=1
+            fi
+          }
+          check derived "$DERIVED" "$DERIVED_COUNT"
+          check explicit "$EXPLICIT" "$EXPLICIT_COUNT"
+          exit "$status"
+      # endregion
+
+      - uses: ./.github/actions/get-branch-name-v2
+        id: branch-info
+      - name: Show current branches
+        run: |
+          echo "Current branch is ${{ steps.branch-info.outputs.branch-name }}"
+
+      #region Test git-branch-drift
+      # These steps check the branch's head on `origin`, which fork PRs never push to, so skip them there.
+      - if: ${{ ! github.event.pull_request.head.repo.fork }}
+        uses: ./.github/actions/git-branch-drift
+
+      - name: Test git-branch-drift fails on mismatch
+        id: git-branch-drift-mismatch
+        if: ${{ ! github.event.pull_request.head.repo.fork }}
+        continue-on-error: true
+        uses: ./.github/actions/git-branch-drift
+        with:
+          expected-sha: '0000000000000000000000000000000000000000'
+      - name: Assert git-branch-drift failed on mismatch
+        if: ${{ ! github.event.pull_request.head.repo.fork && steps.git-branch-drift-mismatch.outcome != 'failure' }}
+        run: |
+          echo "git-branch-drift should fail when the branch has moved"
+          exit 1
+
+      - name: Test git-branch-drift reports mismatch without failing
+        id: git-branch-drift-detect
+        if: ${{ ! github.event.pull_request.head.repo.fork }}
+        uses: ./.github/actions/git-branch-drift
+        with:
+          expected-sha: '0000000000000000000000000000000000000000'
+          fail-on-mismatch: 'false'
+      - name: Assert git-branch-drift reported the mismatch
+        if: ${{ ! github.event.pull_request.head.repo.fork }}
+        env:
+          CHANGED: ${{ steps.git-branch-drift-detect.outputs.changed }}
+          REMOTE_SHA: ${{ steps.git-branch-drift-detect.outputs.remote-sha }}
+        run: |
+          [ "$CHANGED" = "true" ] || { echo "::error::expected changed=true, got $CHANGED"; exit 1; }
+          [ -n "$REMOTE_SHA" ] || { echo "::error::remote-sha output is empty"; exit 1; }
+      #endregion

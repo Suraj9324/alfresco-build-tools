@@ -1,0 +1,36 @@
+name: "Publish helm chart on GitHub "
+description: "Publish new version of an helm chart to the Alfresco repo"
+inputs:
+  github_token:
+    description: "GitHub token"
+    required: true
+  github_username:
+    description: "git config username"
+    required: true
+  github_email:
+    description: "git config email"
+    required: true
+  chart_name:
+    description: "full name of helm chart directory"
+    required: true
+  alpha_suffix:
+    description: "suffix that if found in the version would publish it on incubator repo"
+    required: false
+    default: "SNAPSHOT"
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+    - name: Publish
+      run: ${{ github.action_path }}/publish_chart.sh
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        GH_USERNAME: ${{ inputs.github_username }}
+        GH_EMAIL: ${{ inputs.github_email }}
+        PROJECT_NAME: ${{ inputs.chart_name }}
+        ALPHA_SUFFIX: ${{ inputs.alpha_suffix }}

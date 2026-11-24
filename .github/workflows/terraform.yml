@@ -1,0 +1,627 @@
+name: "Terraform"
+
+on:
+  workflow_call:
+    inputs:
+      terraform_root_path:
+        description: the path to the root module to apply, auto-detected if not provided
+        type: string
+        required: false
+      terraform_operation:
+        description: |
+          the terraform operation to perform (plan, apply or destroy).
+          If not set, the operation will be determined based on the GitHub event.
+          For pull requests, it will run plan and for pushes it will run apply based on the PR plan.
+          For pull requests comments, it will run apply if the comment contains 'terraform apply'.
+        type: string
+        required: false
+      terraform_env:
+        description: the terraform environment to use (e.g. dev, staging, prod), auto-detected if not provided
+        type: string
+        required: false
+      terraform_default_env:
+        description: the default terraform environment to use when auto-detection does not find a specific env (defaults to <terraform_root_path>-dev)
+        type: string
+        required: false
+      create_oidc_token_file:
+        description: whether to create a file with an OIDC token for AWS
+        type: boolean
+        required: false
+        default: false
+      install_kubectl:
+        description: whether to install the kubectl CLI
+        type: boolean
+        required: false
+        default: false
+      terraform_version:
+        description: |
+          the Terraform version (or version constraint) to use when the root module does not pin one itself.
+          A remote/cloud workspace version, required_version, .terraform-version, .tfswitchrc or .tool-versions take precedence.
+          Defaults to 'dependabot', the version used by Dependabot. An empty string falls back to the state file version, then the latest release.
+        type: string
+        required: false
+        default: 'dependabot'
+      kubectl_version:
+        description: the version of kubectl to install (if install_kubectl is true). If not set, the latest stable version will be installed.
+        type: string
+        required: false
+      tfvars_subfolder:
+        description: the subfolder where tfvars files are located (relative to terraform_root_path)
+        type: string
+        required: false
+        default: ''
+      github_app_repo_owner:
+        description: the owner (organization) of the GitHub App used to generate a token for accessing the private 'terraform-alfresco-modules' repository. Requires github_app_token_client_id and GITHUB_TOKEN_PRIVATE_KEY to be set.
+        type: string
+        required: false
+      github_app_token_client_id:
+        description: the client ID of the GitHub App used to generate a token for accessing the private 'terraform-alfresco-modules' repository. Requires github_app_repo_owner and GITHUB_TOKEN_PRIVATE_KEY to be set.
+        type: string
+        required: false
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      BOT_GITHUB_TOKEN:
+        description: a GitHub token used to fetch terraform modules from private GitHub repositories.
+        required: false
+      DOCKER_USERNAME:
+        required: false
+      DOCKER_PASSWORD:
+        required: false
+      RANCHER2_ACCESS_KEY:
+        required: false
+      RANCHER2_SECRET_KEY:
+        required: false
+      AZURE_CREDENTIALS:
+        required: false
+      CUSTOM_SECRET_0:
+        required: false
+      CUSTOM_SECRET_1:
+        required: false
+      CUSTOM_SECRET_2:
+        required: false
+      CUSTOM_SECRET_3:
+        required: false
+      CUSTOM_SECRET_4:
+        required: false
+      CUSTOM_SECRET_5:
+        required: false
+      CUSTOM_SECRET_6:
+        required: false
+      CUSTOM_SECRET_7:
+        required: false
+      CUSTOM_SECRET_8:
+        required: false
+      CUSTOM_SECRET_9:
+        required: false
+      GITHUB_TOKEN_PRIVATE_KEY:
+        required: false
+
+jobs:
+  compute_basic_vars:
+    name: compute basic variables
+    runs-on: ubuntu-slim
+    steps:
+      - name: Validate inputs
+        env:
+          TERRAFORM_OPERATION: ${{ inputs.terraform_operation }}
+          TFVARS_SUBFOLDER: ${{ inputs.tfvars_subfolder }}
+        run: |
+          if [ -z "${TERRAFORM_OPERATION}" ]; then
+            echo "terraform_operation is not set, defaulting to github event based handling."
+          else
+            case "${TERRAFORM_OPERATION}" in
+              apply|destroy|plan)
+                ;;
+              *)
+                echo "Invalid terraform_operation: ${TERRAFORM_OPERATION}. Must be 'apply', 'destroy', or 'plan'."
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [ -z "${TFVARS_SUBFOLDER}" ]; then
+            echo "::warning::tfvars_subfolder input is not set. Consider organizing your tfvars files in a 'vars' subfolder for better structure. Set tfvars_subfolder: 'vars' in your workflow to use this recommended layout."
+          fi
+
+      - name: Evaluate current branch
+        id: get-branch-name
+        uses: $/.github/actions/get-branch-name-v2
+        with:
+          additional-pr-events: true
+
+      - name: Set outputs
+        if: inputs.terraform_root_path == '' || inputs.terraform_env == ''
+        id: set-outputs
+        env:
+          PUSH_ON_DEFAULT_BRANCH: ${{ github.event_name == 'push' && github.event.repository.default_branch == steps.get-branch-name.outputs.branch-name }}
+          PR_AGAINST_DEFAULT_BRANCH: ${{ github.event.repository.default_branch == steps.get-branch-name.outputs.base-branch-name }}
+        run: |
+          echo "Workflow is related to a promotion PR if:"
+          echo "- it's not a push on the default branch (PUSH_ON_DEFAULT_BRANCH=false)"
+          echo "AND"
+          echo "- it's not a PR targeting the default branch (PR_AGAINST_DEFAULT_BRANCH=false)"
+          echo "is_promotion_pr_related=${{ env.PUSH_ON_DEFAULT_BRANCH != 'true' && env.PR_AGAINST_DEFAULT_BRANCH != 'true' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout code (used for auto-detection of terraform root path and/or environment)
+        if: inputs.terraform_root_path == '' || inputs.terraform_env == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/merge', github.event.issue.number) || '' }}
+          fetch-depth: 0
+
+      - name: Retrieve PR or last commit changes (used for auto-detection of terraform root path and/or environment)
+        if: inputs.terraform_root_path == '' || inputs.terraform_env == ''
+        id: last-changes-diff
+        uses: $/.github/actions/github-list-changes
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-detect terraform root path based on changed files
+        if: inputs.terraform_root_path == ''
+        id: detect-path
+        run: |
+          if [ "${{ steps.set-outputs.outputs.is_promotion_pr_related }}" == "true" ]; then
+            PROMOTION_PR_FILTER=$(echo "${{ steps.get-branch-name.outputs.base-branch-name || steps.get-branch-name.outputs.branch-name }}" | cut -d'-' -f1)
+            echo "This is a promotion PR so restricting changed files to folders matching ${PROMOTION_PR_FILTER}"
+          fi
+
+          first_changed_folder=$(echo "${{ steps.last-changes-diff.outputs.all_changed_files }}" \
+            | grep '/' \
+            | cut -d/ -f1 \
+            | grep -Ev '^(\..*|test)$' \
+            | grep "${PROMOTION_PR_FILTER:-}" \
+            | sort -u \
+            | head -1 || true)
+
+          echo "First changed folder: ${first_changed_folder:-none}"
+          echo "terraform_root_path=$first_changed_folder" >> "$GITHUB_OUTPUT"
+
+      - name: Auto-detect terraform environment based on changed files (when running against default branch)
+        if: >-
+          inputs.terraform_env == '' &&
+          steps.set-outputs.outputs.is_promotion_pr_related == 'false'
+        env:
+          TERRAFORM_ROOT_PATH: ${{ steps.detect-path.outputs.terraform_root_path || inputs.terraform_root_path }}
+        id: detect-tfvars
+        run: |
+          if [ -z "${TERRAFORM_ROOT_PATH}" ]; then
+            echo "Cannot auto-detect a terraform environment without a terraform root path. Skipping environment auto-detection."
+            echo "terraform_tfvars_file=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          first_changed_tfvars=$(echo "${{ steps.last-changes-diff.outputs.all_changed_files }}" \
+            | grep -v 'common.tfvars' \
+            | grep -E '^${{ env.TERRAFORM_ROOT_PATH }}/.*\.tfvars$' \
+            | sort -u \
+            | head -1 \
+            | xargs -r basename -s .tfvars)
+
+          if [ -z "$first_changed_tfvars" ]; then
+            DEFAULT_ENV="${{ inputs.terraform_default_env || format('{0}-dev', env.TERRAFORM_ROOT_PATH) }}"
+            echo "No specific tfvars file changed, defaulting to '$DEFAULT_ENV'"
+            first_changed_tfvars="$DEFAULT_ENV"
+          else
+            echo "Automatically selected environment based on tfvars file: $first_changed_tfvars"
+          fi
+
+          echo "terraform_tfvars_file=$first_changed_tfvars" >> "$GITHUB_OUTPUT"
+
+
+      - name: Evaluate environment to target
+        id: basic_vars
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.terraform_env }}" ]; then
+            echo "Using environment from input: ${{ inputs.terraform_env }}"
+            echo "environment_name=${{ inputs.terraform_env }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "${{ steps.detect-tfvars.outputs.terraform_tfvars_file }}" ]; then
+            echo "Using environment from changed tfvars file: ${{ steps.detect-tfvars.outputs.terraform_tfvars_file }}"
+            echo "environment_name=${{ steps.detect-tfvars.outputs.terraform_tfvars_file }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Falling back to PR base branch or push branch name for environment name"
+          BRANCH_NAME="${{ steps.get-branch-name.outputs.base-branch-name || steps.get-branch-name.outputs.branch-name }}"
+          BRANCH_LOWER=${BRANCH_NAME,,}
+          if [ "$BRANCH_LOWER" == "main" ]; then
+            environment="production"
+          elif [[ "$BRANCH_LOWER" =~ ^[a-z][a-z0-9-]{3,}$ ]]; then
+            environment="${BRANCH_LOWER}"
+          else
+            echo "$BRANCH_LOWER is not a valid environment name."
+            echo "It must:"
+            echo " - start with a letter"
+            echo " - contain only lowercase chars, numbers, and hyphens"
+            echo " - be at least 4 characters long"
+            exit 1
+          fi
+
+          echo "Using environment based on branch name: $environment"
+          echo "environment_name=${environment}" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate terraform operation
+        id: operation
+        env:
+          IS_PULL_REQUEST_EVENT: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' }}
+          IS_PUSH_EVENT: ${{ github.event_name == 'push' }}
+          IS_ISSUE_COMMENT_EVENT: ${{ github.event_name == 'issue_comment' }}
+          IS_PR_COMMENT: ${{ github.event.issue.pull_request.html_url != '' }}
+          COMMENT_REQUESTS_PLAN: ${{ contains(github.event.comment.body, 'terraform plan') }}
+          COMMENT_REQUESTS_APPLY: ${{ contains(github.event.comment.body, 'terraform apply') }}
+          TERRAFORM_OPERATION_FROM_INPUTS: ${{ inputs.terraform_operation }}
+        run: |
+          # issue_comment is also fired by comments on plain issues
+          if [[ "$IS_ISSUE_COMMENT_EVENT" == "true" ]] && [[ "$IS_PR_COMMENT" != "true" ]]; then
+            echo "Comment was made on a plain issue, not a pull request. Skipping."
+            echo "terraform_operation=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Resolve a single operation with precedence: plan > apply > destroy
+          if [[ "$IS_PULL_REQUEST_EVENT" == "true" ]] || [[ "$TERRAFORM_OPERATION_FROM_INPUTS" == "plan" ]] || { [[ "$IS_ISSUE_COMMENT_EVENT" == "true" ]] && [[ "$COMMENT_REQUESTS_PLAN" == "true" ]]; }; then
+            operation="plan"
+          elif [[ "$IS_PUSH_EVENT" == "true" ]] || [[ "$TERRAFORM_OPERATION_FROM_INPUTS" == "apply" ]] || { [[ "$IS_ISSUE_COMMENT_EVENT" == "true" ]] && [[ "$COMMENT_REQUESTS_APPLY" == "true" ]]; }; then
+            operation="apply"
+          elif [[ "$TERRAFORM_OPERATION_FROM_INPUTS" == "destroy" ]]; then
+            operation="destroy"
+          elif [[ "$IS_ISSUE_COMMENT_EVENT" == "true" ]]; then
+            echo "Issue comment does not request a terraform operation. Skipping."
+            echo "terraform_operation=" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            echo "Unable to determine terraform operation from the current event and inputs. BUG?" >&2
+            exit 1
+          fi
+
+          echo "Determined terraform operation: $operation"
+          echo "terraform_operation=${operation}" >> "$GITHUB_OUTPUT"
+
+      - name: Authorize terraform plan/apply requested via PR comment
+        # Only PR comments can be authored by an untrusted user: push is guarded by
+        # branch protection and workflow_dispatch by the Actions permission model.
+        if: |
+          github.event_name == 'issue_comment' &&
+          (steps.operation.outputs.terraform_operation == 'plan' || steps.operation.outputs.terraform_operation == 'apply')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          TERRAFORM_OPERATION: ${{ steps.operation.outputs.terraform_operation }}
+        run: |
+          deny() {
+            echo "::error::$1"
+            {
+              echo "### Terraform ${TERRAFORM_OPERATION} denied 🛑"
+              echo "$1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          if ! commenter_permission=$(gh api "repos/${REPOSITORY}/collaborators/${COMMENTER}/permission" --jq '.permission'); then
+            deny "Unable to resolve the permission of @${COMMENTER} on ${REPOSITORY}, refusing to run terraform ${TERRAFORM_OPERATION}."
+          fi
+
+          if ! pr_data=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" --json state,reviewDecision); then
+            deny "Unable to fetch the review status of PR #${PR_NUMBER}, refusing to run terraform ${TERRAFORM_OPERATION}."
+          fi
+
+          pr_state=$(jq -r '.state' <<< "$pr_data")
+          if [ "$pr_state" != "OPEN" ]; then
+            deny "PR #${PR_NUMBER} is ${pr_state}: terraform ${TERRAFORM_OPERATION} can only be triggered from a comment on an open pull request."
+          fi
+
+          if [ "$TERRAFORM_OPERATION" == "apply" ] && [ "$commenter_permission" != "admin" ]; then
+            # honours required reviewers and CODEOWNERS rules from branch protection;
+            # empty when the base branch has no required-review rule configured
+            review_decision=$(jq -r '.reviewDecision // ""' <<< "$pr_data")
+            if [ "$review_decision" != "APPROVED" ]; then
+              deny "PR #${PR_NUMBER} is not approved (review decision: '${review_decision}'): terraform apply can only be triggered from a comment on an approved pull request. Ensure branch protection with required reviews is enabled on the base branch."
+            fi
+          fi
+
+          echo "@${COMMENTER} (${commenter_permission}) is allowed to trigger terraform ${TERRAFORM_OPERATION} on PR #${PR_NUMBER}"
+
+      - name: Add workflow summary info
+        env:
+          TERRAFORM_ROOT_PATH: ${{ (steps.detect-path.outputs.terraform_root_path || inputs.terraform_root_path) }}
+          TERRAFORM_OPERATION: ${{ steps.operation.outputs.terraform_operation }}
+          TERRAFORM_ENV: ${{ steps.basic_vars.outputs.environment_name }}
+        run: |
+          if [ -z "$TERRAFORM_ROOT_PATH" ]; then
+            echo "### Not running Terraform 🚀" >> "$GITHUB_STEP_SUMMARY"
+            echo "Could not determine the root path for Terraform. Assuming there are no Terraform changes to apply, so skipping Terraform execution." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -z "$TERRAFORM_OPERATION" ]; then
+            echo "### Not running Terraform 🚀" >> "$GITHUB_STEP_SUMMARY"
+            echo "Could not determine the Terraform operation to perform. Assuming there are no Terraform changes to apply, so skipping Terraform execution." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### Running Terraform 🚀"
+            echo "- Environment: **${TERRAFORM_ENV}**"
+            echo "- Operation: **${TERRAFORM_OPERATION}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+    outputs:
+      environment_name: ${{ steps.basic_vars.outputs.environment_name }}
+      terraform_root_path: ${{ steps.detect-path.outputs.terraform_root_path || inputs.terraform_root_path }}
+      terraform_operation: ${{ steps.operation.outputs.terraform_operation }}
+
+  terraform:
+    name: terraform ${{ needs.compute_basic_vars.outputs.terraform_operation }} on ${{ needs.compute_basic_vars.outputs.environment_name }}
+    runs-on: ubuntu-latest
+    needs:
+      - compute_basic_vars
+    if: needs.compute_basic_vars.outputs.environment_name != '' && needs.compute_basic_vars.outputs.terraform_root_path != '' && needs.compute_basic_vars.outputs.terraform_operation != ''
+    environment:
+      name: ${{ needs.compute_basic_vars.outputs.environment_name }}
+      # Tracking deployment only when running terraform apply or destroy.
+      # https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/control-deployments#using-environments-without-deployments
+      deployment: ${{ needs.compute_basic_vars.outputs.terraform_operation != 'plan' }}
+    concurrency:
+      group: ${{ needs.compute_basic_vars.outputs.environment_name }}
+      queue: max
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RANCHER2_ACCESS_KEY: ${{ secrets.RANCHER2_ACCESS_KEY }}
+      RANCHER2_SECRET_KEY: ${{ secrets.RANCHER2_SECRET_KEY }}
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      CUSTOM_SECRET_0: ${{ secrets.CUSTOM_SECRET_0 }}
+      CUSTOM_SECRET_1: ${{ secrets.CUSTOM_SECRET_1 }}
+      CUSTOM_SECRET_2: ${{ secrets.CUSTOM_SECRET_2 }}
+      CUSTOM_SECRET_3: ${{ secrets.CUSTOM_SECRET_3 }}
+      CUSTOM_SECRET_4: ${{ secrets.CUSTOM_SECRET_4 }}
+      CUSTOM_SECRET_5: ${{ secrets.CUSTOM_SECRET_5 }}
+      CUSTOM_SECRET_6: ${{ secrets.CUSTOM_SECRET_6 }}
+      CUSTOM_SECRET_7: ${{ secrets.CUSTOM_SECRET_7 }}
+      CUSTOM_SECRET_8: ${{ secrets.CUSTOM_SECRET_8 }}
+      CUSTOM_SECRET_9: ${{ secrets.CUSTOM_SECRET_9 }}
+      RESOURCE_NAME: ${{ vars.RESOURCE_NAME }}
+      TF_VAR_resource_name: ${{ vars.RESOURCE_NAME }}
+      TERRAFORM_PRE_RUN: |
+        set +x -euo pipefail
+        if [ -n "$AZURE_CREDENTIALS" ]; then
+          curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+          CLIENT_ID=$(echo "$AZURE_CREDENTIALS" | jq -r '.clientId')
+          CLIENT_SECRET=$(echo "$AZURE_CREDENTIALS" | jq -r '.clientSecret')
+          TENANT_ID=$(echo "$AZURE_CREDENTIALS" | jq -r '.tenantId')
+          SUBSCRIPTION_ID=$(echo "$AZURE_CREDENTIALS" | jq -r '.subscriptionId')
+          az login --service-principal -u "$CLIENT_ID" -p "$CLIENT_SECRET" --tenant "$TENANT_ID" --output none
+          if [ -n "$SUBSCRIPTION_ID" ] && [ "$SUBSCRIPTION_ID" != "null" ]; then
+            az account set --subscription "$SUBSCRIPTION_ID"
+          fi
+        fi
+        if [ -n "$AWS_ACCESS_KEY_ID" ] || [ -n "${{ vars.AWS_ROLE_ARN }}" ]; then
+          if [ ! -x ./aws/install ]; then
+            curl -sSf https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
+            unzip -q awscliv2.zip
+          fi
+          ./aws/install
+        fi
+        if [ "${{ inputs.install_kubectl }}" == "true" ]; then
+          if [ -z "${{ inputs.kubectl_version }}" ]; then
+            echo "⚙️ Will install latest stable kubectl..."
+            KUBECTL_VERSION=$(curl -sSfL --max-time 10 --retry 3 https://dl.k8s.io/release/stable.txt)
+            echo "✅ Latest stable kubectl version resolved to ${KUBECTL_VERSION}"
+          else
+            echo "⚙️ Will install kubectl version ${{ inputs.kubectl_version }}..."
+            KUBECTL_VERSION="${{ inputs.kubectl_version }}"
+          fi
+
+          echo "📦 Downloading kubectl version ${KUBECTL_VERSION}..."
+          curl -sSfL --max-time 30 --retry 3 -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -sSfL --max-time 10 --retry 3 -o kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+
+          echo "🔍 Verifying kubectl checksum..."
+          if ! echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check --status; then
+            echo "❌ Checksum verification failed for kubectl!"
+            exit 1
+          fi
+
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          rm -f kubectl kubectl.sha256
+          echo "✅ kubectl installed successfully:"
+          kubectl version --client
+        fi
+
+      # https://github.com/dflook/terraform-github-actions/tree/main/terraform-apply#applying-a-plan-using-a-comment
+      PR_CHECKOUT_REF: refs/pull/${{ github.event.issue.number }}/merge
+    steps:
+      - name: Resolve Terraform version
+        id: terraform-version
+        uses: $/.github/actions/resolve-terraform-version
+        with:
+          requested: ${{ inputs.terraform_version }}
+
+      - name: Set Terraform version
+        env:
+          TERRAFORM_VERSION: ${{ steps.terraform-version.outputs.version }}
+        run: echo "TERRAFORM_VERSION=$TERRAFORM_VERSION" >> "$GITHUB_ENV"
+
+      - name: Check environment requirements
+        env:
+          ENVIRONMENT_NAME: ${{ needs.compute_basic_vars.outputs.environment_name }}
+        run: |
+          if [ -z "$ENVIRONMENT_NAME" ]; then
+            echo "Environment name should have been determined at this point, but it's empty. BUG?"
+            exit 1
+          fi
+          if [ -z "${{ vars.RESOURCE_NAME }}" ]; then
+            echo "RESOURCE_NAME must be set in the vars context of $ENVIRONMENT_NAME to provide a unique identifier"
+            exit 1
+          fi
+          if [ -z "${{ vars.TERRAFORM_STATE_BUCKET }}" ] && [ -z "${{ vars.TERRAFORM_STATE_STORAGE_ACCOUNT }}" ]; then
+            echo "Either TERRAFORM_STATE_BUCKET (for AWS S3) or TERRAFORM_STATE_STORAGE_ACCOUNT (for Azure Storage) must be set in the vars context of $ENVIRONMENT_NAME to specify the backend used for terraform state storage"
+            exit 1
+          fi
+          if [ -n "${{ vars.TERRAFORM_STATE_BUCKET }}" ] && [ -n "${{ vars.TERRAFORM_STATE_STORAGE_ACCOUNT }}" ]; then
+            echo "TERRAFORM_STATE_BUCKET and TERRAFORM_STATE_STORAGE_ACCOUNT are mutually exclusive in the vars context of $ENVIRONMENT_NAME; configure exactly one terraform state backend"
+            exit 1
+          fi
+          if [ -n "${{ vars.TERRAFORM_STATE_STORAGE_ACCOUNT }}" ]; then
+            if [ -z "${{ vars.TERRAFORM_STATE_RESOURCE_GROUP }}" ]; then
+              echo "TERRAFORM_STATE_RESOURCE_GROUP must be set in the vars context of $ENVIRONMENT_NAME when using Azure Storage backend"
+              exit 1
+            fi
+            if [ -z "${{ vars.TERRAFORM_STATE_CONTAINER }}" ]; then
+              echo "TERRAFORM_STATE_CONTAINER must be set in the vars context of $ENVIRONMENT_NAME when using Azure Storage backend"
+              exit 1
+            fi
+            if [ -z "${{ secrets.AZURE_CREDENTIALS }}" ]; then
+              echo "AZURE_CREDENTIALS secret must be provided when using Azure Storage backend"
+              exit 1
+            fi
+          fi
+          if [ -n "${{ inputs.github_app_repo_owner }}" ]; then
+            if [ -z "${{ inputs.github_app_token_client_id }}" ] || [ -z "${{ secrets.GITHUB_TOKEN_PRIVATE_KEY }}" ]; then
+              echo "github_app_token_client_id input and GITHUB_TOKEN_PRIVATE_KEY secret must both be provided when github_app_repo_owner is set"
+              exit 1
+            fi
+          fi
+
+      - name: Build backend config
+        id: backend-config
+        env:
+          TERRAFORM_ROOT_PATH: ${{ needs.compute_basic_vars.outputs.terraform_root_path }}
+        run: |
+          if [ -n "${{ vars.TERRAFORM_STATE_STORAGE_ACCOUNT }}" ]; then
+            echo "Using Azure Storage backend: ${{ vars.TERRAFORM_STATE_STORAGE_ACCOUNT }}/${{ vars.TERRAFORM_STATE_CONTAINER }}"
+            {
+              echo "backend_config<<BACKEND"
+              echo "resource_group_name=${{ vars.TERRAFORM_STATE_RESOURCE_GROUP }}"
+              echo "storage_account_name=${{ vars.TERRAFORM_STATE_STORAGE_ACCOUNT }}"
+              echo "container_name=${{ vars.TERRAFORM_STATE_CONTAINER }}"
+              echo "key=${{ vars.RESOURCE_NAME }}/${{ env.TERRAFORM_ROOT_PATH }}/terraform.tfstate"
+              echo "use_cli=true"
+              echo "BACKEND"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "Using AWS S3 backend: ${{ vars.TERRAFORM_STATE_BUCKET }}"
+            {
+              echo "backend_config<<BACKEND"
+              echo "bucket=${{ vars.TERRAFORM_STATE_BUCKET }}"
+              echo "key=${{ vars.RESOURCE_NAME }}/${{ env.TERRAFORM_ROOT_PATH }}/terraform.tfstate"
+              echo "BACKEND"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'issue_comment' && env.PR_CHECKOUT_REF || '' }}
+
+      - name: Warn about required_version overriding the default Terraform version
+        env:
+          TERRAFORM_ROOT_PATH: ${{ needs.compute_basic_vars.outputs.terraform_root_path }}
+        run: |
+          matches=$(grep -nE '^\s*required_version\s*=' "$TERRAFORM_ROOT_PATH"/*.tf || true)
+          if [ -n "$matches" ]; then
+            echo "::warning title=required_version overrides terraform_version::The root module $TERRAFORM_ROOT_PATH sets required_version, so the terraform_version input (default ${TERRAFORM_VERSION:-latest}) is ignored. Remove it to run the workflow Terraform version."
+            echo "$matches"
+          fi
+
+      - name: Install OIDC Client from Core Package
+        if: ${{ inputs.create_oidc_token_file }}
+        run: npm install @actions/core@1.11.0 @actions/http-client@2.2.3
+
+      - name: Request token
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        if: ${{ inputs.create_oidc_token_file }}
+        id: idtoken
+        with:
+          script: |
+            const coredemo = require('@actions/core')
+            let id_token = await coredemo.getIDToken("sts.amazonaws.com")
+            coredemo.setOutput('id_token', id_token)
+
+      - name: Save token to file
+        if: ${{ inputs.create_oidc_token_file }}
+        run: echo "${{ steps.idtoken.outputs.id_token }}" >> idtoken.json
+
+      - name: Assume AWS Role when AWS_ROLE_ARN is set
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: vars.AWS_ROLE_ARN != ''
+        with:
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: TerraformWorkflow
+
+      - name: Load environment variables from yml
+        uses: $/.github/actions/env-load-from-yaml
+        with:
+          yml_path: ${{ needs.compute_basic_vars.outputs.terraform_root_path }}/tfenv.yml
+
+      - name: Generate GitHub App token
+        if: inputs.github_app_repo_owner != ''
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.github_app_token_client_id }}
+          private-key: ${{ secrets.GITHUB_TOKEN_PRIVATE_KEY }}
+          owner: ${{ inputs.github_app_repo_owner }}
+          repositories: |
+            terraform-alfresco-modules
+
+      - name: Set TERRAFORM_HTTP_CREDENTIALS
+        run: |
+          if [ -n "${{ steps.app-token.outputs.token }}" ]; then
+            echo "TERRAFORM_HTTP_CREDENTIALS=github.com/${{ inputs.github_app_repo_owner }}=x-access-token:${{ steps.app-token.outputs.token }}" >> "$GITHUB_ENV"
+          elif [ -n "${{ secrets.BOT_GITHUB_TOKEN }}" ]; then
+            echo "TERRAFORM_HTTP_CREDENTIALS=github.com/Alfresco=alfresco-build:${{ secrets.BOT_GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Terraform validate
+        if: needs.compute_basic_vars.outputs.terraform_operation == 'plan' && github.run_attempt == 1
+        uses: dflook/terraform-validate@1a494dd58a93cf8410e7748587d60c778087b43f # v3.1.3
+        with:
+          path: ${{ needs.compute_basic_vars.outputs.terraform_root_path }}
+          backend_config: ${{ steps.backend-config.outputs.backend_config }}
+
+      - name: Terraform plan
+        uses: dflook/terraform-plan@a96e6b967241380e532d9059f275b87a1a4060cb # v3.1.3
+        if: needs.compute_basic_vars.outputs.terraform_operation == 'plan'
+        with:
+          label: ${{ vars.RESOURCE_NAME }} ${{ needs.compute_basic_vars.outputs.terraform_root_path }}
+          path: ${{ needs.compute_basic_vars.outputs.terraform_root_path }}
+          var_file: |
+            ${{ needs.compute_basic_vars.outputs.terraform_root_path }}/${{ inputs.tfvars_subfolder && format('{0}/', inputs.tfvars_subfolder) || '' }}common.tfvars
+            ${{ needs.compute_basic_vars.outputs.terraform_root_path }}/${{ inputs.tfvars_subfolder && format('{0}/', inputs.tfvars_subfolder) || '' }}${{ needs.compute_basic_vars.outputs.environment_name }}.tfvars
+          backend_config: ${{ steps.backend-config.outputs.backend_config }}
+
+      - name: Terraform apply
+        uses: dflook/terraform-apply@c2d5b9ce3fefcaefa4bbd484691457ad7842b4a3 # v3.1.3
+        if: needs.compute_basic_vars.outputs.terraform_operation == 'apply'
+        with:
+          label: ${{ vars.RESOURCE_NAME }} ${{ needs.compute_basic_vars.outputs.terraform_root_path }}
+          path: ${{ needs.compute_basic_vars.outputs.terraform_root_path }}
+          auto_approve: ${{ inputs.terraform_operation == 'apply' }}
+          var_file: |
+            ${{ needs.compute_basic_vars.outputs.terraform_root_path }}/${{ inputs.tfvars_subfolder && format('{0}/', inputs.tfvars_subfolder) || '' }}common.tfvars
+            ${{ needs.compute_basic_vars.outputs.terraform_root_path }}/${{ inputs.tfvars_subfolder && format('{0}/', inputs.tfvars_subfolder) || '' }}${{ needs.compute_basic_vars.outputs.environment_name }}.tfvars
+          backend_config: ${{ steps.backend-config.outputs.backend_config }}
+
+      - name: Terraform destroy
+        uses: dflook/terraform-destroy@6da7270dfefea4c042664e00ad2a5d2d2a82334f # v3.1.3
+        if: needs.compute_basic_vars.outputs.terraform_operation == 'destroy'
+        with:
+          path: ${{ needs.compute_basic_vars.outputs.terraform_root_path }}
+          var_file: |
+            ${{ needs.compute_basic_vars.outputs.terraform_root_path }}/${{ inputs.tfvars_subfolder && format('{0}/', inputs.tfvars_subfolder) || '' }}common.tfvars
+            ${{ needs.compute_basic_vars.outputs.terraform_root_path }}/${{ inputs.tfvars_subfolder && format('{0}/', inputs.tfvars_subfolder) || '' }}${{ needs.compute_basic_vars.outputs.environment_name }}.tfvars
+          backend_config: ${{ steps.backend-config.outputs.backend_config }}

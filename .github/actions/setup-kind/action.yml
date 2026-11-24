@@ -1,0 +1,293 @@
+name: "Setup a KinD cluster"
+description: "Spin a local Kubernetes cluster with ingress-nginx"
+inputs:
+  kind-version:
+    description: |
+      The kind version to use. Versions available at:
+      https://github.com/kubernetes-sigs/kind/releases
+    default: v0.33.0
+  kind-node-image:
+    description: |
+      The Kind docker node image to use. Should match the same kind version at:
+      https://github.com/kubernetes-sigs/kind/releases
+    default: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+  kind-wait:
+    description: The duration to wait for the control plane to become ready
+    default: 60s
+  ingress-nginx-ref:
+    description: |
+      the Nginx ingress ref to get the ingress controller deployment manifest from
+      (https://github.com/kubernetes/ingress-nginx). Consider main (the default) a floating tag which can result in
+      deploying any version (including betas) and non repeatable builds.
+      Set to "skip" or "none" to NOT install ingress-nginx.
+    default: main
+  traefik-enabled:
+    description: |
+      Whether to install Traefik ingress controller instead of ingress-nginx. If
+      set to true, the action will ignore the `ingress-nginx-ref` input and
+      install Traefik using the version specified in `traefik-chart-version`.
+    default: "false"
+  traefik-chart-version:
+    description: |
+      The Traefik helm chart version to install. Check available versions on
+      https://artifacthub.io/packages/helm/traefik/traefik
+    default: "41.0.2"
+  cloud-provider-kind-enabled:
+    description: |
+      Whether to install and run cloud-provider-kind alongside the KinD cluster.
+      This allows to use LoadBalancer services with KinD, which simplifies
+      access to the ingress controller. This is required for Traefik.
+    default: "false"
+  cloud-provider-kind-version:
+    description: |
+      The cloud-provider-kind version to install and run. Check available
+      versions on https://github.com/kubernetes-sigs/cloud-provider-kind
+    default: "0.10.0"
+  cloud-provider-kind-enable-lb-port-mapping:
+    description: |
+      Whether to enable the cloud-provider-kind feature to map LoadBalancer ports to localhost.
+      This simplifies access to the ingress controller when using cloud-provider-kind.
+    default: "true"
+  metrics:
+    description: Whether Metrics Server should be installed upon cluster creation
+    default: "false"
+  import-docker-credentials-secret-name:
+    description: |
+      Whether to create a secret using the given name using file $HOME/.docker/config.json.
+      You have to login to one or more registries before using this option.
+  ingress-creation-timeout:
+    description: |
+      The timeout for waiting for the ingress controller to become ready.
+      Default is 90 seconds, which should be enough for most cases.
+    default: 90s
+  kind-config-path:
+    description: |
+      Path to a custom kind configuration file. If not provided and ingress-nginx is being installed,
+      the action will use the default configuration located at `./kind-ingress-nginx.yml` relative to the action.yml file.
+    required: false
+
+outputs:
+  ingress-endpoint:
+    description: |
+      The endpoint (hostname:port) of the ingress controller (if installed) and
+      cloud-provider-kind is enabled
+    value: ${{ steps.get-ingress-endpoint.outputs.endpoint }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate inputs and set reusable outputs
+      shell: bash
+      id: set-outputs
+      run: |
+        NGINX_ENABLED=${{ !contains(fromJson('["skip", "none"]'), inputs.ingress-nginx-ref) }}
+        TRAEFIK_ENABLED=${{ inputs.traefik-enabled }}
+        CLOUD_PROVIDER_KIND_ENABLED=${{ inputs.cloud-provider-kind-enabled }}
+        KIND_CONFIG_PATH=${{ inputs.kind-config-path != '' && inputs.kind-config-path || '' }}
+
+        if [ "$NGINX_ENABLED" == "true" ] && [ "$TRAEFIK_ENABLED" == "true" ]; then
+          echo "Traefik enabled takes precedence over ingress-nginx, disabling ingress-nginx..."
+          NGINX_ENABLED=false
+        fi
+
+        if [ "$TRAEFIK_ENABLED" == "true" ] && [ "$CLOUD_PROVIDER_KIND_ENABLED" != "true" ]; then
+          echo "Error: cloud-provider-kind must be enabled when installing Traefik ingress controller."
+          exit 1
+        fi
+
+        if [ "$NGINX_ENABLED" == "true" ]; then
+          echo "Chosen ingress controller: nginx"
+          echo "ingress=nginx" >> $GITHUB_OUTPUT
+          KIND_CONFIG_PATH=${KIND_CONFIG_PATH:-${{ format('{0}/kind-ingress-nginx.yml', github.action_path) }}}
+        elif [ "$TRAEFIK_ENABLED" == "true" ]; then
+          echo "Chosen ingress controller: traefik"
+          echo "ingress=traefik" >> $GITHUB_OUTPUT
+        else
+          echo "No ingress controller will be installed"
+          echo "ingress=none" >> $GITHUB_OUTPUT
+        fi
+
+        echo "Using kind config file: ${KIND_CONFIG_PATH}"
+        echo "kind-config-path=${KIND_CONFIG_PATH}" >> $GITHUB_OUTPUT
+
+    - name: Create cluster
+      uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+      with:
+        config: ${{ steps.set-outputs.outputs.kind-config-path }}
+        version: ${{ inputs.kind-version }}
+        node_image: ${{ inputs.kind-node-image }}
+        wait: ${{ inputs.kind-wait }}
+
+    - name: Install Metrics Server
+      shell: bash
+      if: inputs.metrics == 'true'
+      run: >-
+        helm install metrics-server metrics-server
+        --repo https://kubernetes-sigs.github.io/metrics-server/
+        --set args={--kubelet-insecure-tls}
+        --namespace kube-system
+    - name: Wait for Metrics Server to be ready
+      shell: bash
+      if: inputs.metrics == 'true'
+      run: |
+        kubectl wait --namespace kube-system \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/name=metrics-server \
+          --timeout=120s || {
+            echo "Metrics Server failed to become ready. Debugging information:"
+            echo "=== Pod Description ==="
+            kubectl describe pods -n kube-system -l app.kubernetes.io/name=metrics-server
+            echo "=== Pod Logs ==="
+            kubectl logs -n kube-system -l app.kubernetes.io/name=metrics-server --tail=100
+            exit 1
+          }
+
+    - name: Setup cloud-provider-kind
+      if: inputs.cloud-provider-kind-enabled == 'true'
+      uses: $/.github/actions/setup-github-release-binary
+      with:
+        binary_name: cloud-provider-kind
+        repo: kubernetes-sigs/cloud-provider-kind
+        version: ${{ inputs.cloud-provider-kind-version }}
+        test_args: --help
+
+    - name: Run cloud-provider-kind
+      shell: bash
+      if: inputs.cloud-provider-kind-enabled == 'true'
+      run: >-
+        cloud-provider-kind
+        --enable-lb-port-mapping=${{ inputs.cloud-provider-kind-enable-lb-port-mapping }}
+        > /tmp/cloud-provider.log 2>&1 &
+    - name: Create registries auth secret
+      shell: bash
+      if: inputs.import-docker-credentials-secret-name != ''
+      run: |
+        kubectl create secret generic ${{ inputs.import-docker-credentials-secret-name }} \
+          --from-file=.dockerconfigjson=$HOME/.docker/config.json \
+          --type=kubernetes.io/dockerconfigjson
+
+    - name: Install ingress-nginx controller
+      shell: bash
+      if: steps.set-outputs.outputs.ingress == 'nginx'
+      env:
+        NGINX_MANIFEST_URL: >-
+          https://raw.githubusercontent.com/kubernetes/ingress-nginx/${{ inputs.ingress-nginx-ref }}/deploy/static/provider/kind/deploy.yaml
+      run: |
+        kubectl apply -f "${NGINX_MANIFEST_URL}"
+
+    - name: Wait for ingress-nginx to be ready
+      shell: bash
+      if: steps.set-outputs.outputs.ingress == 'nginx'
+      run: |
+        kubectl wait --namespace ingress-nginx \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller \
+          --timeout=${{ inputs.ingress-creation-timeout }} || {
+            echo "Ingress controller failed to become ready. Debugging information:"
+            echo "=== Pod Description ==="
+            kubectl describe pods -n ingress-nginx -l app.kubernetes.io/component=controller
+            echo "=== Pod Logs ==="
+            kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller --tail=100
+            exit 1
+          }
+
+    - name: Apply nginx ingress class for traefik retrocompat
+      shell: bash
+      if: steps.set-outputs.outputs.ingress == 'traefik'
+      run: |
+        kubectl apply -f - <<EOF
+        apiVersion: networking.k8s.io/v1
+        kind: IngressClass
+        metadata:
+          name: nginx
+        spec:
+          controller: k8s.io/ingress-nginx
+        EOF
+
+    - name: Set additional Traefik outputs depending on chart major version
+      shell: bash
+      id: set-traefik-outputs
+      if: steps.set-outputs.outputs.ingress == 'traefik'
+      env:
+        TRAEFIK_CHART_VERSION: ${{ inputs.traefik-chart-version }}
+      run: |
+        TRAEFIK_MAJOR_VERSION=$(echo "${TRAEFIK_CHART_VERSION}" | cut -d. -f1 | tr -d 'v')
+        if [ "$TRAEFIK_MAJOR_VERSION" -ge "40" ]; then
+          echo "traefik-nginx-provider-name=kubernetesIngressNGINX" >> "$GITHUB_OUTPUT"
+        else
+          echo "traefik-nginx-provider-name=kubernetesIngressNginx" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install Traefik ingress controller
+      shell: bash
+      if: steps.set-outputs.outputs.ingress == 'traefik'
+      env:
+        NGINX_PROVIDER_NAME: ${{ steps.set-traefik-outputs.outputs.traefik-nginx-provider-name }}
+      run: |
+        helm repo add traefik https://traefik.github.io/charts
+        helm upgrade --install traefik traefik/traefik \
+          --version ${{ inputs.traefik-chart-version }} \
+          --set providers.${{ env.NGINX_PROVIDER_NAME }}.enabled=true \
+          --set providers.${{ env.NGINX_PROVIDER_NAME }}.watchIngressWithoutClass=true \
+          -n traefik \
+          --create-namespace
+
+    - name: Wait for Traefik ingress to be ready
+      shell: bash
+      if: steps.set-outputs.outputs.ingress == 'traefik'
+      run: |
+        kubectl wait --namespace traefik \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/name=traefik \
+          --timeout=${{ inputs.ingress-creation-timeout }} || {
+            echo "Traefik ingress controller failed to become ready. Debugging information:"
+            echo "=== Pod Description ==="
+            kubectl describe pods -n traefik -l app.kubernetes.io/name=traefik
+            echo "=== Pod Logs ==="
+            kubectl logs -n traefik -l app.kubernetes.io/name=traefik --tail=100
+            exit 1
+          }
+
+    - name: Wait and return the HTTP endpoint of the ingress controller
+      id: get-ingress-endpoint
+      shell: bash
+      if: steps.set-outputs.outputs.ingress != 'none' && inputs.cloud-provider-kind-enabled == 'true'
+      env:
+        INGRESS_NAMESPACE: ${{ steps.set-outputs.outputs.ingress == 'nginx' && 'ingress-nginx' || 'traefik' }}
+        INGRESS_SERVICE_NAME: ${{ steps.set-outputs.outputs.ingress == 'nginx' && 'ingress-nginx-controller' || 'traefik' }}
+      run: |
+        # Retry loop to wait for LoadBalancer IP
+        for i in {1..30}; do
+          EXTERNAL_IP=$(kubectl -n $INGRESS_NAMESPACE get svc $INGRESS_SERVICE_NAME -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          if [ -n "$EXTERNAL_IP" ]; then
+            PORT=$(kubectl -n $INGRESS_NAMESPACE get svc $INGRESS_SERVICE_NAME -o jsonpath='{.spec.ports[0].port}')
+            echo "Endpoint for LoadBalancer: ${EXTERNAL_IP}:${PORT}"
+            break
+          fi
+          echo "Waiting for LoadBalancer IP... ($i/30)"
+          sleep 2
+        done
+
+        if [ -z "$EXTERNAL_IP" ]; then
+          echo "Error: Timed out waiting for LoadBalancer IP."
+          exit 1
+        fi
+
+        if [ "${{ inputs.cloud-provider-kind-enable-lb-port-mapping }}" == "true" ]; then
+          EXTERNAL_IP="localhost"
+
+          echo "cloud-provider-kind LB port mapping enabled, retrieving mapped port from docker..."
+          CID="$(docker ps --filter 'name=^/kindccm-' --format '{{.ID}}' | head -n 1)"
+          DOCKER_PORT_OUTPUT=$(docker port $CID 80/tcp | head -n 1)
+          PORT=$(echo $DOCKER_PORT_OUTPUT | awk -F: '{print $NF}')
+          if [ -z "$PORT" ]; then
+            echo "Error: Failed to retrieve mapped port from docker."
+            echo "Docker port output: $DOCKER_PORT_OUTPUT"
+            echo "Full docker ps output for debugging:"
+            docker ps -a
+            exit 1
+          fi
+          echo "Endpoint for LoadBalancer: ${EXTERNAL_IP}:${PORT}"
+        fi
+
+        echo "endpoint=${EXTERNAL_IP}:${PORT}" >> $GITHUB_OUTPUT

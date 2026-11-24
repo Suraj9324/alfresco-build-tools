@@ -1,0 +1,19 @@
+name: "env-load-from-yaml"
+description: "Load environment variables from a yaml file"
+inputs:
+  ignore_regex:
+    description: "Bash regex to ignore certain lines"
+    required: false
+    default: ^$
+  yml_path:
+    description: "Path to the yaml file to parse"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Parse env global
+      shell: bash
+      env:
+        IGNORE_REGEX: ${{ inputs.ignore_regex }}
+        YML_PATH: ${{ inputs.yml_path }}
+      run: ${{ github.action_path }}/env-load-from-yaml.sh

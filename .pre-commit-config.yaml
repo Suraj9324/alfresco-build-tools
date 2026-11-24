@@ -1,0 +1,92 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
+    hooks:
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+        exclude: '.updatecli/templates'
+      - id: check-json
+      - id: check-xml
+      - id: check-merge-conflict
+      - id: fix-byte-order-marker
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+      - id: end-of-file-fixer
+        exclude: '(.*/dist/.*|\.github/workflows/.*\.lock\.yml$)'
+      - id: trailing-whitespace
+        exclude: '(.*/dist/.*|\.github/workflows/.*\.lock\.yml$)'
+
+  - repo: https://github.com/sirosen/check-jsonschema
+    rev: 39478bf2c099a58683d3f1aedf675105318b078d  # frozen: 0.39.0
+    hooks:
+      - id: check-dependabot
+      - id: check-github-actions
+      - id: check-github-workflows
+        exclude: ^\.github/workflows/.*\.lock\.yml$
+
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: cbcdc463be5464e25e3e955a511599a67b9b987f  # frozen: v0.50.0
+    hooks:
+    - id: markdownlint
+      exclude: ^(\.github/workflows/.*\.lock\.yml|CLAUDE\.md)$
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # frozen: v1.7.12
+    hooks:
+      - id: actionlint
+        args:
+          - -ignore
+          - 'unexpected key "queue" for "concurrency" section. expected one of "cancel-in-progress", "group"'
+          - -ignore
+          - 'specifying action "\$/.*" in invalid format'
+        exclude: ^(\.github/tests/|\.github/workflows/.*\.lock\.yml$)
+
+  - repo: https://github.com/hyland/github-actions-ensure-sha-pinned-actions
+    rev: 9f71a10c9852b115cfcb146ec2d8d09e2b89593f  # frozen: v2.1.1
+    hooks:
+      - id: gha-sha-convert
+        exclude: ^\.github/tests/
+
+  - repo: local
+    hooks:
+      - id: compile-agentic-workflows
+        name: Validate GitHub Agentic Workflow compilation
+        language: system
+        entry: .github/scripts/compile_agentic_workflows.sh
+        pass_filenames: false
+        files: ^\.github/workflows/.*\.md$
+        stages: [pre-commit]
+
+      - id: check-self-ref-syntax
+        name: Ensure internal actions use $/ syntax
+        language: system
+        entry: bash -c '! grep -rEn "Alfresco/alfresco-build-tools/\.github|\$/[^ ]*@" .github --include="*.yml" --include="*.yaml"'
+        pass_filenames: false
+        files: ^\.github/(actions|workflows)/.*\.ya?ml$
+
+      - id: check-readme-missing-entries
+        name: Check README entries for GitHub Actions missing entries
+        language: system
+        entry: .github/scripts/check_readme.sh
+        pass_filenames: false
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: ef6cf06c079dd6b299dfc720b0f14400c9d168e1  # frozen: v0.17.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: a6564f5d57444e123433a5c9af733e3975c77229  # frozen: v0.11.0.1-1
+    hooks:
+      - id: shellcheck
+        args: [ "--severity=style" ]
+        files: ^\.github/scripts/.*\.sh$
+
+  - repo: https://github.com/thlorenz/doctoc
+    rev: facaad890e72966c88a6a5592f5b6a01c422deb2  # frozen: v2.5.0
+    hooks:
+      - id: doctoc
+        args: [--maxlevel, '3', --github, --notitle]
+        files: ^docs/README\.md$

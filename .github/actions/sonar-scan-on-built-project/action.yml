@@ -1,0 +1,103 @@
+name: SonarQube Scan
+description: >-
+    Reusable action for running SonarQube scans with Maven on projects that were already built in prior jobs
+    and have their artifacts available in the workspace. This action is designed to be used in conjunction with
+    `maven-build` action and will start by downloading the target and m2 artifacts uploaded by the `maven-build` action.
+    Parameters with maven credentials have to be passed as environment variables.
+
+inputs:
+  sonar-host-url:
+    description: The SonarQube host URL.
+    required: false
+    default: 'https://sonarcloud.io'
+  sonar-organization:
+    description: The SonarQube organization.
+    required: false
+    default: 'alfresco'
+  sonar-project:
+    description: The SonarQube project key.
+    required: true
+  sonar-coverage-jacoco-xmlReportPaths:
+    description: Path to the JaCoCo XML report for SonarQube coverage.
+    required: false
+    default: '**/target/site/jacoco-*/jacoco.xml'
+  property-to-update:
+    description: Maven property to update in case of a preview.
+    required: false
+  maven-resolver-transport-options:
+    description: Maven resolver transport options
+    required: false
+  m2-uploaded-group-path:
+    description: The path to the group id uploaded from m2 repository
+    required: true
+  target-folder-artifacts-pattern:
+    description: Pattern to match artifacts uploaded from target folder in a previous job.
+    required: false
+    default: 'target*'
+  m2-current-build-artifacts-pattern:
+    description: Pattern to match current build artifacts uploaded from m2 repository from a previous job.
+    required: false
+    default: 'm2*'
+  sonar-token:
+    description: SonarQube token for authentication.
+    required: true
+  ghcr-username:
+    description: GitHub Container Registry username.
+    required: true
+  ghcr-password:
+    description: GitHub Container Registry password.
+    required: true
+  maven-version:
+    description: Maven version to setup, i.e. 3.9+ for Maven Build Cache extension
+    required: false
+    default: ''
+  java-version:
+    description: The Java version to perform the build
+    required: false
+    default: '11'
+
+runs:
+  using: composite
+  steps:
+    - name: Check the workspace is ready for Sonar
+      shell: bash
+      run: |
+        if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
+          echo "::error::This action analyses sources the caller has already checked out, and Sonar needs the full history: check out with 'fetch-depth: 0' in the job that calls it."
+          exit 1
+        fi
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          echo "::error::Sonar needs the full history to compute the PR diff, but the workspace is a shallow clone. Set 'fetch-depth: 0' on the actions/checkout step of the job that calls this action."
+          exit 1
+        fi
+
+    - name: Download target
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        pattern: ${{ inputs.target-folder-artifacts-pattern }}
+        merge-multiple: true
+
+    - name: Download M2 build artifacts
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        pattern: ${{ inputs.m2-current-build-artifacts-pattern }}
+        merge-multiple: true
+        path: ${{ inputs.m2-uploaded-group-path }}
+
+    - name: SonarQube Scan
+      uses: $/.github/actions/maven-build
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+      with:
+        maven-command: >-
+          sonar:sonar
+          -Dsonar.host.url=${{ inputs.sonar-host-url }}
+          -Dsonar.organization=${{ inputs.sonar-organization }}
+          -Dsonar.projectKey=${{ inputs.sonar-project }}
+          -Dsonar.coverage.jacoco.xmlReportPaths=${{ inputs.sonar-coverage-jacoco-xmlReportPaths }}
+        property-to-update: ${{ inputs.property-to-update }}
+        maven-resolver-transport-options: ${{ inputs.maven-resolver-transport-options }}
+        ghcr-username: ${{ inputs.ghcr-username }}
+        ghcr-password: ${{ inputs.ghcr-password }}
+        maven-version: ${{ inputs.maven-version }}
+        java-version: ${{ inputs.java-version }}

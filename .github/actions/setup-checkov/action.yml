@@ -1,0 +1,17 @@
+name: 'Setup checkov'
+description: 'Set up a specific version of checkov and add it to the PATH.'
+inputs:
+  version:
+    description: 'Version of checkov'
+    required: false
+    default: '3.2.490' # cannot be automated via updatecli because bridgecrew allow api access only from whitelisted IPs
+runs:
+  using: "composite"
+  steps:
+    - uses: $/.github/actions/setup-github-release-binary
+      with:
+        repo: bridgecrewio/checkov
+        version: ${{ inputs.version }}
+        x86_64_arch: 'X86_64'
+        aarch64_arch: 'arm64'
+        url_template: '${VERSION}/${NAME}_${OS}_${ARCH}.zip'

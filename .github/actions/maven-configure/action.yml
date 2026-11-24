@@ -1,0 +1,116 @@
+name: Configure Maven, Set Up Java, restore Maven Cache
+description: Restores Maven cache, sets up JDK, and configures Maven build cache.
+
+inputs:
+  java-version:
+    description: The Java version to set up.
+    required: true
+    default: '11'
+  java-distribution:
+    description: The Java distribution to set up.
+    required: true
+    default: 'temurin'
+  maven-version:
+    description: Maven version to set up.
+    required: false
+    default: ''
+  maven-setup-cache-key-suffix:
+    description: Suffix for the Maven setup cache key.
+    required: false
+    default: ''
+  maven-settings-path:
+    description: Path to the Maven settings.xml file to use.
+    required: false
+    default: 'settings.xml'
+  skip-tests-label:
+    description: The label to skip tests.
+    required: false
+    default: 'skip-tests'
+  verbose:
+    description: Whether additional logs should be displayed.
+    required: false
+    default: 'false'
+  preview-label:
+    description: The label for creating a preview version.
+    required: false
+    default: 'preview'
+
+outputs:
+  maven-options:
+    description: Computed Maven options.
+    value: ${{ steps.compute-maven-options.outputs.result }}
+  skip-tests:
+    description: Whether to skip tests.
+    value: ${{ steps.set-skip-tests-env-variable.outputs.skip-tests }}
+  preview-version:
+    description: The preview version when it's a preview.
+    value: ${{ steps.set-preview-version.outputs.preview-version }}
+  cache-hit:
+    description: Whether an exact match was found for the Maven repository cache primary key.
+    value: ${{ steps.restore-maven-cache.outputs.cache-hit }}
+  cache-primary-key:
+    description: The primary key used to restore the Maven repository cache.
+    value: ${{ steps.restore-maven-cache.outputs.cache-primary-key }}
+
+runs:
+  using: composite
+  steps:
+    - name: Restore maven cache
+      id: restore-maven-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+
+    - name: Set up JDK
+      uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+      with:
+        java-version: ${{ inputs.java-version }}
+        distribution: ${{ inputs.java-distribution }}
+
+    - name: Set up Maven
+      if: inputs.maven-version != ''
+      uses: $/.github/actions/setup-maven
+      with:
+        version: ${{ inputs.maven-version }}
+        cache-key-suffix: ${{ inputs.maven-setup-cache-key-suffix }}
+
+    - name: Set skip tests env variable
+      id: set-skip-tests-env-variable
+      env:
+        SKIP_TESTS: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, inputs.skip-tests-label) }}
+      shell: bash
+      run: |
+        echo "SKIP_TESTS=$SKIP_TESTS" >> $GITHUB_ENV
+        echo "skip-tests=$SKIP_TESTS" >> $GITHUB_OUTPUT
+
+    - name: Compute maven options
+      id: compute-maven-options
+      shell: bash
+      env:
+        MAVEN_SETTINGS_PATH: ${{ inputs.maven-settings-path }}
+      run: |
+        NTP='--no-transfer-progress'
+        ${{ inputs.verbose }} && NTP=''
+        TEST_OPTIONS=''
+        [[ $SKIP_TESTS == 'true' ]] && TEST_OPTIONS='-DskipTests=true -DskipITs=true'
+        echo "result=--show-version --settings $MAVEN_SETTINGS_PATH $NTP $TEST_OPTIONS" >> $GITHUB_OUTPUT
+
+    - name: Set is_preview env variable
+      id: set-is-preview-env-variable
+      env:
+        IS_PREVIEW: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, inputs.preview-label) }}
+      shell: bash
+      run: |
+        echo "IS_PREVIEW=$IS_PREVIEW" >> $GITHUB_ENV
+
+    - name: Set preview version
+      id: set-preview-version
+      if: env.IS_PREVIEW == 'true'
+      shell: bash
+      run: |
+        GITHUB_PR_NUMBER=PR-${{ github.event.pull_request.number }}
+        echo "preview-version=0.0.1-$GITHUB_PR_NUMBER-SNAPSHOT" >> $GITHUB_OUTPUT
+        echo "GITHUB_PR_NUMBER=$GITHUB_PR_NUMBER" >> $GITHUB_ENV

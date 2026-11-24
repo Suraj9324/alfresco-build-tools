@@ -1,0 +1,110 @@
+name: Pre-commit for terraform
+
+on:
+  workflow_call:
+    inputs:
+      BOT_GITHUB_USERNAME:
+        description: 'Username to allow fetching private modules on GitHub (BOT_GITHUB_TOKEN is required)'
+        type: string
+        required: false
+      github_app_client_id:
+        description: the client ID of the GitHub App used to generate a token for accessing private terraform module repositories. Requires github_app_repositories_owner and GITHUB_APP_PRIVATE_KEY to be set.
+        type: string
+        required: false
+      github_app_repositories_owner:
+        description: the owner (organization) of the GitHub App used to generate a token for accessing private terraform module repositories. Requires github_app_client_id and GITHUB_APP_PRIVATE_KEY to be set.
+        type: string
+        required: false
+      github_app_repositories:
+        description: optional comma or newline-separated list of repositories to scope the GitHub App token to. When empty, the token can access all repositories the App installation is granted on github_app_repositories_owner.
+        type: string
+        required: false
+      terraform_version:
+        description: |
+          the Terraform version (or version constraint) to use when the repository does not pin one itself.
+          A .terraform-version file at the repository root takes precedence.
+          Defaults to 'dependabot', the version used by Dependabot. An empty string installs the latest release.
+        type: string
+        required: false
+        default: 'dependabot'
+    secrets:
+      BOT_GITHUB_TOKEN:
+        required: false
+      GITHUB_APP_PRIVATE_KEY:
+        description: 'GitHub App private key used to generate a token for accessing private terraform modules (used when github_app_client_id is set)'
+        required: false
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # required only when auto-commit is enabled
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Generate GitHub App token
+        if: inputs.github_app_client_id != ''
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.github_app_client_id }}
+          private-key: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.github_app_repositories_owner }}
+          repositories: ${{ inputs.github_app_repositories }}
+
+      - name: Setup authentication for private terraform modules
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_APP_REPOSITORIES_OWNER: ${{ inputs.github_app_repositories_owner }}
+          BOT_GITHUB_USERNAME: ${{ inputs.BOT_GITHUB_USERNAME }}
+          BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          if [ -n "$APP_TOKEN" ]; then
+            if [ -z "$GITHUB_APP_REPOSITORIES_OWNER" ]; then
+              echo "::error::github_app_repositories_owner must be set to properly propagate authentication to the correct org"
+              exit 1
+            fi
+            echo "Using GitHub App token scoped to ${GITHUB_APP_REPOSITORIES_OWNER}"
+            git config --global url."https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_APP_REPOSITORIES_OWNER}/".insteadOf "https://github.com/${GITHUB_APP_REPOSITORIES_OWNER}/"
+          elif [ -n "$BOT_GITHUB_USERNAME" ] && [ -n "$BOT_GITHUB_TOKEN" ]; then
+            echo "Using BOT_GITHUB_TOKEN for github.com"
+            git config --global url."https://${BOT_GITHUB_USERNAME}:${BOT_GITHUB_TOKEN}@github.com".insteadOf "https://github.com"
+          else
+            echo "No private terraform module authentication configured"
+          fi
+
+      - name: Resolve default Terraform version
+        id: default-terraform-version
+        uses: $/.github/actions/resolve-terraform-version
+        with:
+          requested: ${{ inputs.terraform_version }}
+
+      - name: Detect terraform version
+        id: detect-terraform-version
+        env:
+          DEFAULT_TERRAFORM_VERSION: ${{ steps.default-terraform-version.outputs.version }}
+        run: |
+          version=""
+          if [ -f .terraform-version ]; then
+            version=$(tr -d '[:space:]' < .terraform-version)
+          fi
+          echo "terraform_version=${version:-$DEFAULT_TERRAFORM_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install tflint
+        uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+
+      - name: Install checkov
+        uses: $/.github/actions/setup-checkov
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ steps.detect-terraform-version.outputs.terraform_version }}
+
+      - name: Install terraform-docs
+        uses: $/.github/actions/setup-terraform-docs
+
+      - uses: $/.github/actions/pre-commit
+        with:
+          auto-commit: "true" # optionally commit automated fix changes back
+          skip_checkout: "false" # mandatory with auto-commit

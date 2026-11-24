@@ -1,0 +1,57 @@
+description: Update pom files to the next pre-release
+name: Update pom to next pre-release
+inputs:
+  prerelease-type:
+    description: The type of the prerelease, i.e. `alpha`, `beta`, `rc`
+    required: false
+    default: alpha
+  maven-cli-opts:
+    description: extra maven properties
+    required: false
+  property-to-update:
+    description: property to update in addition to the version of the pom file
+    required: false
+  version:
+    description: custom version to be set
+    required: false
+outputs:
+  next-prerelease:
+    description: "Next prerelease"
+    value: ${{ steps.resolve-version.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Parse next version from POM
+      id: parse-next-final-version
+      if: inputs.version == ''
+      shell: bash
+      run: |
+        NEXT_VERSION=$(yq -p=xml e '.project.version' pom.xml | grep -o "[0-9]*\.[0-9]*.[0-9]*")
+        echo "Next final version: $NEXT_VERSION"
+        echo "result=$NEXT_VERSION" >> $GITHUB_OUTPUT
+
+    - id: next-prerelease-resolver
+      name: Calculate next internal release
+      if: inputs.version == ''
+      uses: $/.github/actions/calculate-next-internal-version
+      with:
+        next-version: ${{ steps.parse-next-final-version.outputs.result }}
+        prerelease-type: ${{ inputs.prerelease-type }}
+
+    - id: resolve-version
+      name: Resolve version
+      shell: bash
+      run: |
+        if [ ${{ inputs.version }} != '' ]
+        then
+          echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${{ steps.next-prerelease-resolver.outputs.next-prerelease }}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Update pom files to the new version
+      uses: $/.github/actions/maven-update-pom-version
+      with:
+        version: ${{ steps.resolve-version.outputs.version }}
+        maven-cli-opts: ${{ inputs.maven-cli-opts }}
+        property-to-update: ${{ inputs.property-to-update }}

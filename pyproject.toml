@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 120
+extend-exclude = [
+    ".pytest_cache",
+    ".tox",
+    ".venv",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "venv",
+]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "C90"]
+ignore = ["E203"] # whitespace before ':' - conflicts with the formatter's slice formatting
+
+[tool.ruff.lint.mccabe]
+max-complexity = 18

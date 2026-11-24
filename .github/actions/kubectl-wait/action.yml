@@ -1,0 +1,58 @@
+---
+name: Kubectl wait
+description: |
+  Wait for all resources inside a namespace to match a given condition.
+  Useful for waiting for all pods to be ready before proceeding.
+inputs:
+  namespace:
+    description: Namespace to wait for
+    required: false
+    default: default
+  wait-timeout:
+    description: Timeout for the wait command
+    required: false
+    default: 10m
+  wait-for-what:
+    description: What to wait for (jsonpath, condition)
+    required: false
+    default: condition
+  wait-condition:
+    description: Condition to wait for
+    required: false
+    default: Ready
+  wait-resource:
+    description: Resource to wait for
+    required: false
+    default: pods
+runs:
+  using: composite
+  steps:
+
+    - name: Watch resources
+      shell: bash
+      run: |
+        kubectl wait --for=create namespace/${{ inputs.namespace }} --timeout=5s > /dev/null
+        echo "Namespace ${{ inputs.namespace }} is created."
+
+        kubectl wait \
+          --for=create ${{ inputs.wait-resource }} \
+          -n ${{ inputs.namespace }} \
+          --timeout=5s \
+          --all=true > /dev/null
+        echo "All resources ${{ inputs.wait-resource }} are created in namespace ${{ inputs.namespace }}."
+
+        echo "Starting to watch resources..."
+        kubectl get ${{ inputs.wait-resource }} --watch -n ${{ inputs.namespace }} &
+        kubectl wait \
+          --for=${{ inputs.wait-for-what }}=${{ inputs.wait-condition }} \
+          -n ${{ inputs.namespace }} \
+          --timeout=${{ inputs.wait-timeout }} \
+          --all=true \
+          ${{ inputs.wait-resource }}
+
+    - name: Spit resources status after wait
+      shell: bash
+      if: always()
+      run: |
+        kubectl get ${{ inputs.wait-resource }} -n ${{ inputs.namespace }}
+        kubectl describe ${{ inputs.wait-resource }} -n ${{ inputs.namespace }}

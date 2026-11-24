@@ -1,0 +1,61 @@
+name: Deploy artifacts to S3 Bucket
+description: Deploys a local file or directory of artifacts to S3, or copies an object or prefix from one S3 location to another.
+
+inputs:
+  aws-region:
+    description: AWS region
+    required: true
+  aws-role-arn:
+    description: AWS role ARN to assume for deployment
+    required: true
+  source:
+    description: Local file/directory or s3:// URI (object or prefix) to copy from. A single file/object is placed under destination; a directory/prefix is copied recursively. Takes precedence over deploy-dir if both are set.
+    required: false
+    default: ""
+  deploy-dir:
+    description: "Deprecated: use source instead. Local directory containing artifacts to upload."
+    required: false
+    default: ./deploy_dir
+  copy-props:
+    description: Controls whether S3 object metadata is copied during S3-to-S3 copy. Only used when source is an s3:// URI.
+    required: false
+    default: "none"
+  destination:
+    description: s3:// URI to copy to. Takes precedence over s3-bucket and s3-path if both are set.
+    required: false
+    default: ""
+  s3-bucket:
+    description: "Deprecated: use destination instead. S3 bucket name."
+    required: false
+    default: ""
+  s3-path:
+    description: "Deprecated: use destination instead. Path within the S3 bucket (without leading slash)."
+    required: false
+    default: ""
+  role-duration-seconds:
+    description: Duration in seconds for the assumed AWS role session.
+    required: false
+    default: "3600"
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        aws-region: ${{ inputs.aws-region }}
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        role-session-name: ${{ github.event.repository.name }}-s3-upload-${{ github.run_id }}
+        role-duration-seconds: ${{ inputs.role-duration-seconds }}
+
+    - name: Upload or copy to S3 bucket
+      shell: bash
+      env:
+        SOURCE: ${{ inputs.source }}
+        DEPLOY_DIR: ${{ inputs.deploy-dir }}
+        COPY_PROPS: ${{ inputs.copy-props }}
+        DESTINATION: ${{ inputs.destination }}
+        S3_BUCKET: ${{ inputs.s3-bucket }}
+        S3_PATH: ${{ inputs.s3-path }}
+      run: |
+        "${{ github.action_path }}/s3-upload.sh"

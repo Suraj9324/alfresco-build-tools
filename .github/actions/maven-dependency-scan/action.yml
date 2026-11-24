@@ -1,0 +1,63 @@
+name: Create Dependency Graph
+description: Create dependency graph for the project
+
+inputs:
+  restore-artifact-pattern:
+    description: Pattern to match artifacts.
+    required: false
+  restore-artifact-path:
+    description: Path to the artifact directory.
+    required: false
+  java-version:
+    description: Java version to use.
+    required: true
+  maven-version:
+    description: Maven version to use.
+    required: true
+  maven-args:
+    description: Maven arguments for dependency submission.
+    required: true
+  maven-username:
+    description: Maven username for authentication.
+    required: false
+  maven-password:
+    description: Maven password for authentication.
+    required: false
+  maven-settings-path:
+    description: Path to the Maven settings.xml file to use.
+    required: false
+    default: 'settings.xml'
+  ghcr-username:
+    description: ghcr.io user name
+    required: false
+  ghcr-password:
+    description: ghcr.io password
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Download M2 build artifacts
+      if: ${{ inputs.restore-artifact-pattern != '' }}
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        pattern: ${{ inputs.restore-artifact-pattern }}
+        merge-multiple: true
+        path: ${{ inputs.restore-artifact-path }}
+
+    - uses: $/.github/actions/maven-configure
+      id: maven-configure
+      with:
+        java-version: ${{ inputs.java-version }}
+        maven-version: ${{ inputs.maven-version }}
+        maven-settings-path: ${{ inputs.maven-settings-path }}
+
+    - name: Submit Dependency Graph
+      uses: advanced-security/maven-dependency-submission-action@a64327a7329c9939cf675e458452febe1894a70c # v6.0.1
+      with:
+        maven-args: ${{ steps.maven-configure.outputs.maven-options }} ${{ inputs.maven-args }}
+      env:
+        MAVEN_USERNAME: ${{ inputs.maven-username }}
+        MAVEN_PASSWORD: ${{ inputs.maven-password }}
+        GHCR_USERNAME: ${{ inputs.ghcr-username }}
+        GHCR_PASSWORD: ${{ inputs.ghcr-password }}

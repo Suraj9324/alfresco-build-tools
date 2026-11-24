@@ -1,0 +1,14 @@
+name: Test setup-helm-docs
+description: >
+  Just a test for setup-helm-docs
+inputs:
+  expected-version:
+    description: 'Version of helm-docs'
+    required: false
+runs:
+  using: composite
+  steps:
+    - name: Check helm-docs version
+      shell: bash
+      run: |
+        [ "$(helm-docs -v | awk '{print $NF}')" = "${{ inputs.expected-version }}" ]

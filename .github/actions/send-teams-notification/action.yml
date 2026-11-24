@@ -1,0 +1,365 @@
+description: Sends a teams notification
+name: Send a teams notification
+inputs:
+  webhook-url:
+    description: 'Microsoft Teams Incoming Webhooks URL'
+    required: true
+  title:
+    description: 'Text to show as message title'
+    required: false
+  message:
+    description: 'An optional message that overrides the default one. If declaring any mention-users/tags, the message should include at least one instance of each declared <at>mentionable entity</at>'
+    required: false
+  append:
+    description: 'Whether the optional message should be added after the default one'
+    required: false
+    default: "false"
+  needs:
+    description: 'JSON parsed needs context'
+    required: false
+    default: '{}'
+  dry-run:
+    description: 'Do not actually send the message'
+    required: false
+    default: 'false'
+  status:
+    description: 'The workflow status: if not filled, it will be computed based on the completed steps status'
+    required: false
+    default: ''
+  on-workflow-run:
+    description: "Which run the card describes: 'triggering' (the default) or 'self', the run sending the card. Has no effect on other events."
+    required: false
+    default: triggering
+  mention-users:
+    description: 'Comma-separated list of users to mention in format "display name|email" (e.g.: "John Doe|john.doe@example.com,Jane Doe|jane.doe@example.com")'
+    required: false
+    default: ''
+  mention-tags:
+    description: 'Comma-separated list of Teams tags to mention in format "tag name|tag id" (e.g.: "Security Champions|base64IdIncluding==")'
+    required: false
+    default: ''
+  card-actions:
+    description: 'JSON array of Adaptive Card actions (e.g. Action.OpenUrl buttons) appended to the card'
+    required: false
+    default: '[]'
+  card-extra-body:
+    description: 'JSON array of Adaptive Card body elements (e.g. a FactSet or monospace log block) appended after the message'
+    required: false
+    default: '[]'
+  skip_checkout:
+    description: If the internal checkout action should be skipped or not
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      if: inputs.skip_checkout == 'false'
+
+    - name: Compute workflow status
+      id: compute-workflow-status
+      if: ${{ inputs.status == '' }}
+      shell: bash
+      run: |
+        API_URL="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100"
+
+        RUNS=$(curl -s -H "Authorization: token ${{ github.token }}" "${API_URL}")
+
+        failure=$(echo $RUNS | \
+        jq -r '.jobs[].steps[] | select(.status == "completed" and .conclusion == "failure").conclusion' | \
+        wc -l)
+
+        cancelled=$(echo $RUNS | \
+        jq -r '.jobs[].steps[] | select(.status == "completed" and .conclusion == "cancelled").conclusion' | \
+        wc -l)
+
+        if [ "${failure}" -gt 0 ]; then
+          status="failure"
+        elif [ "${cancelled}" -gt 0 ]; then
+          status="cancelled"
+        else
+          status="success"
+        fi
+
+        echo "status=${status}" >> $GITHUB_OUTPUT
+
+    - name: Compute color
+      shell: bash
+      id: compute-color
+      env:
+        STATUS: ${{ inputs.status || steps.compute-workflow-status.outputs.status }}
+      run: |
+        COLOR=808080
+        case $STATUS in
+          success)
+            COLOR=36A64F
+            ;;
+          failure)
+            COLOR=A30200
+            ;;
+        esac
+        echo "result=$COLOR" >> $GITHUB_OUTPUT
+
+    - name: Compute needs
+      id: compute-needs
+      shell: bash
+      env:
+        NEEDS: ${{ inputs.needs }}
+      run: |
+        echo "result<<EOF" >> $GITHUB_OUTPUT
+        echo $NEEDS | jq -r 'to_entries | map([.key, .value.result]|join(": ")) | join("\n\n")' >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Compute message
+      id: compute-message
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BLOCK_MESSAGE: ${{ inputs.message }}
+        APPEND: ${{ inputs.append }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        ISSUE_BODY: ${{ github.event.issue.body }}
+        COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        NEEDS: ${{ steps.compute-needs.outputs.result }}
+      run: |
+        ${{ github.action_path }}/compute-message.sh >> $GITHUB_OUTPUT
+
+    - name: Compute event
+      id: compute-event
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SHA: ${{ github.sha }}
+      run: |
+        RESULT="$EVENT_NAME"
+        if [[ "$EVENT_NAME" == 'pull_request' ]]; then
+          RESULT="[$EVENT_NAME #$PR_NUMBER]($REPO_URL/pull/$PR_NUMBER)"
+        elif [[ "$EVENT_NAME" == 'push' ]]; then
+          RESULT="[$EVENT_NAME]($REPO_URL/commit/$SHA/checks)"
+        fi
+        echo "result=$RESULT" >> $GITHUB_OUTPUT
+
+    - name: Get branch name
+      id: get-branch-name
+      uses: $/.github/actions/get-branch-name-v2
+
+    - name: Resolve run context
+      id: run-context
+      shell: bash
+      env:
+        ON_WORKFLOW_RUN: ${{ inputs.on-workflow-run }}
+        REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        WR_SHA: ${{ github.event.workflow_run.head_sha }}
+        WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        WR_RUN_ID: ${{ github.event.workflow_run.id }}
+        WR_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        WR_WORKFLOW: ${{ github.event.workflow_run.name }}
+        SELF_SHA: ${{ github.sha }}
+        SELF_BRANCH: ${{ steps.get-branch-name.outputs.branch-name }}
+        SELF_RUN_ID: ${{ github.run_id }}
+        SELF_RUN_ATTEMPT: ${{ github.run_attempt }}
+        SELF_WORKFLOW: ${{ github.workflow }}
+      run: |
+        ${{ github.action_path }}/resolve-run-context.sh >> $GITHUB_OUTPUT
+
+    - name: Transform mentions to JSON entities
+      id: transform-mentions
+      shell: bash
+      env:
+        USERS: ${{ inputs.mention-users }}
+        TAGS: ${{ inputs.mention-tags }}
+      run: |
+        ${{ github.action_path }}/transform-mentions.sh >> $GITHUB_OUTPUT
+
+    - name: Compute actor URLs
+      id: compute-actor-urls
+      shell: bash
+      env:
+        TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        SERVER_URL: ${{ github.server_url }}
+        AVATARS_URL: https://avatars.githubusercontent.com
+      run: |
+        # Handle different actor types
+        if [[ "$TRIGGERING_ACTOR" == *"[bot]" ]]; then
+          # All bots (github-actions[bot], dependabot[bot], etc.)
+          BOT_NAME=${TRIGGERING_ACTOR%\[bot\]}
+          echo "actor_url=$SERVER_URL/apps/$BOT_NAME" >> $GITHUB_OUTPUT
+          echo "actor_avatar_url=$AVATARS_URL/$BOT_NAME?s=32" >> $GITHUB_OUTPUT
+        else
+          # Regular users
+          echo "actor_url=$SERVER_URL/$TRIGGERING_ACTOR" >> $GITHUB_OUTPUT
+          echo "actor_avatar_url=$AVATARS_URL/$TRIGGERING_ACTOR?s=32" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Compute extra body
+      id: compute-extra-body
+      shell: bash
+      env:
+        EXTRA_BODY: ${{ inputs.card-extra-body }}
+      run: |
+        ${{ github.action_path }}/compute-extra-body.sh >> $GITHUB_OUTPUT
+
+    - name: Send teams notification
+      shell: bash
+      env:
+        WEBHOOK_URL: ${{ inputs.webhook-url }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        PAYLOAD: >-
+          {
+            "type": "message",
+            "attachments": [
+              {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                  "type": "AdaptiveCard",
+                  "body": [
+                    {
+                      "type": "TextBlock",
+                      "size": "medium",
+                      "weight": "bolder",
+                      "text": "${{ inputs.title || format('Notification on {0} on branch [`{1}`]({2}/{3}/tree/{4})', steps.compute-event.outputs.result, steps.run-context.outputs.branch, github.server_url, github.repository, steps.run-context.outputs.branch) }}",
+                      "style": "heading",
+                      "wrap": true
+                    },
+                    {
+                      "type": "ColumnSet",
+                      "columns": [
+                        {
+                          "type": "Column",
+                          "items": [
+                            {
+                              "type": "Image",
+                              "style": "person",
+                              "url": "${{ steps.compute-actor-urls.outputs.actor_avatar_url }}",
+                              "altText": "${{ github.triggering_actor }}",
+                              "size": "small"
+                            }
+                          ],
+                          "width": "auto"
+                        },
+                        {
+                          "type": "Column",
+                          "items": [
+                            {
+                              "type": "TextBlock",
+                              "text": "[${{ github.triggering_actor }}](${{ steps.compute-actor-urls.outputs.actor_url }})"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "Column",
+                          "items": [
+                            {
+                              "type": "Image",
+                              "style": "person",
+                              "url": "https://slack.github.com/static/img/favicon-neutral.png",
+                              "altText": "GitHub",
+                              "size": "small"
+                            }
+                          ],
+                          "width": "auto"
+                        },
+                        {
+                          "type": "Column",
+                          "items": [
+                            {
+                              "type": "TextBlock",
+                              "text": "[${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "ColumnSet",
+                      "columns": [
+                        {
+                          "type": "Column",
+                          "items": [
+                            {
+                              "type": "TextBlock",
+                              "text": "**Action**: [${{ steps.run-context.outputs.workflow-title }}](${{ steps.run-context.outputs.run-link }})"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "Column",
+                          "items": [
+                            {
+                              "type": "TextBlock",
+                              "text": "**Commit**: [`${{ steps.run-context.outputs.small-sha }}`](${{ github.server_url }}/${{ github.repository }}/commit/${{ steps.run-context.outputs.sha }})"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "ColumnSet",
+                      "columns": [
+                        {
+                          "type": "Column",
+                          "items": [
+                            {
+                              "type": "TextBlock",
+                              "text": "**Message**"
+                            },
+                            {
+                              "type": "TextBlock",
+                              "text": "${{ steps.compute-message.outputs.result }} ",
+                              "wrap": true
+                            }
+                          ]
+                        }
+                      ]
+                    }${{ steps.compute-extra-body.outputs.result }}
+                  ],
+                  "actions": ${{ inputs.card-actions || '[]' }},
+                  "backgroundImage": {
+                    "url": "https://singlecolorimage.com/get/${{ steps.compute-color.outputs.result }}/2x2",
+                    "fillMode": "RepeatHorizontally"
+                  },
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  "version": "1.5",
+                  "msteams": {
+                    "width": "full",
+                    "entities": ${{ steps.transform-mentions.outputs.result }}
+                  }
+                }
+              }
+            ]
+          }
+      run: |
+        set -euo pipefail
+
+        if ! jq -e . >/dev/null 2>&1 <<<"${PAYLOAD}"; then
+          echo "::error::Computed Teams payload is not valid JSON"
+          echo "${PAYLOAD}"
+          exit 1
+        fi
+
+        if [ -n "${DRY_RUN}" ] && [ "${DRY_RUN}" != "false" ]; then
+          echo "Dry run - skipping notification send. Payload:"
+          jq . <<<"${PAYLOAD}"
+          exit 0
+        fi
+
+        response_file="$(mktemp)"
+        http_code="$(curl -sS -o "${response_file}" -w '%{http_code}' \
+          -X POST -H 'Content-Type: application/json' \
+          --data-raw "${PAYLOAD}" "${WEBHOOK_URL}")"
+
+        echo "Response status: ${http_code}"
+        cat "${response_file}" && echo
+
+        case "${http_code}" in
+          200 | 202)
+            echo "Notification sent to Microsoft Teams"
+            ;;
+          *)
+            echo "::error::Failed to send notification to Microsoft Teams (HTTP ${http_code})"
+            exit 1
+            ;;
+        esac

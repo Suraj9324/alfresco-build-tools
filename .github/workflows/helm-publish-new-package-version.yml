@@ -1,0 +1,91 @@
+name: Publish helm package
+
+on:
+  workflow_call:
+    inputs:
+      next-version:
+        description: "Next final version to be release"
+        type: string
+        required: true
+      chart-dir:
+        description: "Path to the directory holding Chart.yml file"
+        type: string
+        required: false
+      helm-charts-repo:
+        description: "The name of the repository where the package will be added"
+        type: string
+        required: true
+      helm-charts-repo-branch:
+        description: "The name of the branch where the package will be added"
+        type: string
+        required: true
+      helm-charts-repo-subfolder:
+        description: "The name of the subfolder inside the charts repository where the package should be added"
+        type: string
+        required: false
+      helm-charts-repo-base-url:
+        description: "Helm chart repo base url"
+        type: string
+        required: false
+      helm-docs-version:
+        description: 'Version of helm-docs'
+        type: string
+        required: false
+    outputs:
+      version:
+        description: "The version of the new published package"
+        value: ${{ jobs.publish.outputs.version }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next-release.outputs.next-prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: next-release
+        name: Calculate next internal release
+        uses: $/.github/actions/calculate-next-internal-version
+        with:
+          next-version: ${{ inputs.next-version }}
+
+      - name: Set version env variable
+        env:
+          VERSION: ${{ steps.next-release.outputs.next-prerelease }}
+        run: |
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Update chart version
+        uses: $/.github/actions/helm-update-chart-version
+        with:
+          new-version: ${{ steps.next-release.outputs.next-prerelease }}
+          chart-dir: ${{ inputs.chart-dir }}
+          helm-docs-version: ${{ inputs.helm-docs-version }}
+
+      - uses: $/.github/actions/git-commit-changes
+        with:
+          username: ${{ secrets.BOT_GITHUB_USERNAME }}
+          add-options: -u
+          commit-message: "release ${{ steps.next-release.outputs.next-prerelease }}"
+
+      - name: Create local tag
+        run: git tag -a "$VERSION" -m "Release version $VERSION"
+
+      - name: Package Helm Chart
+        id: package-helm-chart
+        uses: $/.github/actions/helm-package-chart
+        with:
+          chart-dir: ${{ inputs.chart-dir }}
+
+      - name: Push tag
+        run: git push origin "$VERSION"
+
+      - name: Publish Helm chart
+        uses: $/.github/actions/helm-publish-chart
+        with:
+            helm-charts-repo: ${{ inputs.helm-charts-repo }}
+            helm-charts-repo-branch: ${{ inputs.helm-charts-repo-branch }}
+            chart-package: ${{ steps.package-helm-chart.outputs.package-file-path }}
+            token: ${{ secrets.BOT_GITHUB_TOKEN }}
+            git-username: ${{ secrets.BOT_GITHUB_USERNAME }}

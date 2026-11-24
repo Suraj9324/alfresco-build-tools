@@ -1,0 +1,114 @@
+name: Maven Release (Slim)
+description: Sets the release version, deploys artifacts with Maven, optionally tags the release, then sets the next development version.
+
+inputs:
+  token:
+    required: true
+    description: GitHub token required for authentication.
+  release-version:
+    required: true
+    description: The version of the release (tag).
+  development-version:
+    required: true
+    description: The version that will be set in pom files after the release (next dev version)
+  release-profile:
+    required: false
+    description: Maven profile used for release. Defaults to "release".
+    default: release
+  maven-args:
+    required: false
+    description: Additional Maven arguments for release. Defaults to "-DskipTests".
+    default: -DskipTests
+  create-tag:
+    required: false
+    description: Boolean if should create tag.
+    default: 'true'
+  commit-message-prefix:
+    required: false
+    description: Prefix used by bot for commit message. Defaults to "[skip ci]".
+    default: '[skip ci]'
+  post-version-command:
+    required: false
+    description: Optional custom command to run after each "versions:set" call, i.e. after setting the release version and after setting the next development version (e.g. "mvn generate-sources").
+    default: ''
+  fail-on-concurrent-commits:
+    required: false
+    description: Fail the release if new commits appeared on the branch since the run started.
+    default: 'true'
+  prerelease-profile:
+    required: false
+    description: Maven profile activated, together with release-profile, when the release version is a prerelease (e.g. to deploy it to a different repository). Disabled when empty.
+    default: ''
+  prerelease-version-marker:
+    required: false
+    description: Text in the release version that marks it as a prerelease.
+    default: '-A.'
+
+runs:
+  using: composite
+  steps:
+    - name: "Check for concurrent commits before starting the release"
+      if: inputs.fail-on-concurrent-commits == 'true'
+      uses: $/.github/actions/git-branch-drift
+
+    - name: "Set release version to ${{ inputs.release-version }}"
+      run: mvn -B -ntp versions:set -DnewVersion="${{ inputs.release-version }}" -DgenerateBackupPoms=false
+      shell: bash
+
+    - name: "Run post-version command after release version"
+      if: inputs.post-version-command != ''
+      run: ${{ inputs.post-version-command }}
+      shell: bash
+
+    - name: "Select release profiles"
+      id: release-profiles
+      env:
+        RELEASE_VERSION: ${{ inputs.release-version }}
+        RELEASE_PROFILE: ${{ inputs.release-profile }}
+        PRERELEASE_PROFILE: ${{ inputs.prerelease-profile }}
+        PRERELEASE_MARKER: ${{ inputs.prerelease-version-marker }}
+      run: ${{ github.action_path }}/release-profiles.sh
+      shell: bash
+
+    - name: "Deploy release version ${{ inputs.release-version }}"
+      run: mvn -B -ntp clean deploy -P ${{ steps.release-profiles.outputs.profiles }} -Dproject.revision.key=${{ github.sha }} ${{ inputs.maven-args }}
+      shell: bash
+
+    - name: "Check for concurrent commits before committing the release"
+      if: inputs.fail-on-concurrent-commits == 'true'
+      uses: $/.github/actions/git-branch-drift
+
+    - name: "Commit release version ${{ inputs.release-version }}"
+      uses: iarekylew00t/verified-bot-commit@3a1e72c2443cce5574f76a9b2bb36e355d667743 # v2.3.7
+      with:
+        token: ${{ inputs.token }}
+        ref: ${{ github.event.pull_request.head.ref || github.ref }}
+        files: |
+          pom.xml
+          **/pom.xml
+        message: "${{ inputs.commit-message-prefix }} Release version ${{ inputs.release-version }}"
+    - name: "Tag release version"
+      if: inputs.create-tag == 'true'
+      run: |
+        git tag "${{ inputs.release-version }}"
+        git push origin "${{ inputs.release-version }}"
+      shell: bash
+
+    - name: "Set next development version to ${{ inputs.development-version }}"
+      run: mvn -B -ntp versions:set -DnewVersion="${{ inputs.development-version }}" -DgenerateBackupPoms=false
+      shell: bash
+
+    - name: "Run post-version command after development version"
+      if: inputs.post-version-command != ''
+      run: ${{ inputs.post-version-command }}
+      shell: bash
+
+    - name: "Commit next development version ${{ inputs.development-version }}"
+      uses: iarekylew00t/verified-bot-commit@3a1e72c2443cce5574f76a9b2bb36e355d667743 # v2.3.7
+      with:
+        token: ${{ inputs.token }}
+        ref: ${{ github.event.pull_request.head.ref || github.ref }}
+        files: |
+          pom.xml
+          **/pom.xml
+        message: "${{ inputs.commit-message-prefix }} Prepare next development version ${{ inputs.development-version }}"

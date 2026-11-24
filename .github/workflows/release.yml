@@ -1,0 +1,28 @@
+name: Release
+
+on:
+  pull_request:
+    types:
+    - closed
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Release type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+    release:
+        name: Release
+        if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
+        uses: ./.github/workflows/reusable-release.yml
+        with:
+          release_type_override: ${{ inputs.release_type }}
+          release_command: ./.github/scripts/release.sh
+          github_app_client_id: ${{ vars.GH_APP_ENGINEERING_CONTRIB_CLIENT_ID }}
+        secrets:
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_ENGINEERING_CONTRIB_PRIVATE_KEY }}

@@ -1,0 +1,55 @@
+name: Stale PR Cleanup
+
+on:
+  workflow_call:
+    inputs:
+      stale-days:
+        description: "Number of days before a PR is marked as stale"
+        required: false
+        type: number
+        default: 30
+      close-after-stale-days:
+        description: "Number of days after stale label before closing the PR"
+        required: false
+        type: number
+        default: 15
+      exempt-pr-labels:
+        description: "Comma-separated list of labels that exempt a PR from being marked as stale"
+        required: false
+        type: string
+        default: "keep-open,dependencies"
+      operations-per-run:
+        description: "Maximum number of operations per run"
+        required: false
+        type: number
+        default: 100
+      debug-only:
+        description: "Run in debug mode without actually marking/closing PRs"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark and close stale PRs
+        uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          stale-pr-message: |
+            This PR has been inactive for ${{ inputs['stale-days'] }} days.
+            It will be closed in ${{ inputs['close-after-stale-days'] }} days if no activity occurs.
+          close-pr-message: |
+            Closing this PR due to inactivity.
+          ascending: true
+          days-before-pr-stale: ${{ inputs['stale-days'] }}
+          days-before-pr-close: ${{ inputs['close-after-stale-days'] }}
+          exempt-pr-labels: ${{ inputs['exempt-pr-labels'] }}
+          operations-per-run: ${{ inputs['operations-per-run'] }}
+          debug-only: ${{ inputs['debug-only'] }}
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
